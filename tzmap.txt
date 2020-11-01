@@ -1,0 +1,14 @@
+// k-d tree of tz polygons in world
+// world map is in normalized lat/long domain of [-1..1] x [-1..1]
+// k-d format is:
+// - idea 1.:
+//   - Byte-coded: [0Add dddd] [jjjj jjjj] or [1nnn nnnn] [nnnn nnnn]
+//     - A: split axis orientation: 0: horizontal, 1: vertical
+//     - d (6 bits): split datum location in 64ths of the current bounding box
+//       - special value of zero means "pad byte" and is ignored
+//     - j: jump distance in 4-byte units
+//       - special value of 0 means next two bytes store jump in 4-byte units ("long jump" [jjjj jjjj] [jjjj jjjj])
+//     - n (15 bits): leaf node number
+
+
+
