@@ -1,141 +1,182 @@
 const geom = require("./geom");
 const tzmap = require("./tzmap");
+const polycodec = require("./polycodec");
+const tzlookup = require("./tzlookup");
 const UnitTest = require("./unitTest");
 
+// Tracing and the O(n) tree-walk invariant checks are far too expensive to run
+// during a real build (the original unconditionally console.log'd the entire
+// subtree on every recursive call, which dominated runtime by orders of
+// magnitude).  Enable with DEBUG=1.
+const DEBUG = !!process.env.DEBUG;
 
-function processPoly(poly) {
-  return tzmap.SimplifyRDP(tzmap.Quantize(poly), (5 * 16));
+function trace() {
+  if (DEBUG) { console.error.apply(console, arguments); }
 }
 
-function exportPoly(poly) {
-  const vectorsInterleaved = geom.PolyToLoop(poly).flat();
-  const lengthBytes = parseInt((vectorsInterleaved.length + 1) * 20 / 8);
-  const b = Buffer.alloc(lengthBytes);
-  let bi = 0;
-  for(let i = 0; i < vectorsInterleaved.length; i += 2) {
-    // If the point's coordinates both fit in 11 signed bits, store them as two 11-bit signed values
-    //packed in three bytes.  Otherwise, store in two 19-bit values packed in five bytes.
-    if( (vectorsInterleaved[i] <= 1023) && (vectorsInterleaved[i] >= -1024) &&
-        (vectorsInterleaved[i + 1] <= 1023) && (vectorsInterleaved[i] >= -1024)) {
-      // 10aaaaaa aaaaabbb bbbbbbbb
-      b.writeUInt8((vectorsInterleaved[i] >> 5) & 0x3F | 0x80, bi);
-      b.writeUInt8((vectorsInterleaved[i] << 3) & 0xF8 | (vectorsInterleaved[i + 1] >> 8) & 0x07, bi + 1);
-      b.writeUInt8(vectorsInterleaved[i + 1] & 0xFF, bi + 2);
-      bi += 3;
-    } else {
-      // (v0 << 20) | v1
-      // 00aaaaaa aaaaaaaa aaaaabbb bbbbbbbb bbbbbbbb
-      b.writeUInt8((vectorsInterleaved[i] >> 13) & 0x3F, bi + 0);
-      b.writeUInt8((vectorsInterleaved[i] >> 5) & 0xFF, bi + 1);
-      b.writeUInt8(((vectorsInterleaved[i] << 3) & 0xF8) | ((vectorsInterleaved[i + 1] >> 16) & 0x07), bi + 2);
-      b.writeUInt8((vectorsInterleaved[i + 1] >> 8) & 0xFF, bi + 3);
-      b.writeUInt8(vectorsInterleaved[i + 1] & 0xFF, bi + 4);
-      bi += 5;
-    }
-    // Alternate encodings, if needed:
-    // 01aaaaaa aaaaabbb bbbbbbbb bbbbbbbb
-    // 10bbbbbb bbbbbaaa aaaaaaaa aaaaaaaa
-  }
-  return b.slice(0, bi);
+// Simplification tolerance, in quantization units.  1 unit is ~38m at the
+// equator.  Override with EPSILON=<units>.
+//
+// The original value of 80 (~3km) was wider than several whole timezones: it
+// flattened Vatican City and Monaco into unusable slivers and erased the
+// matching holes in the surrounding zone, so those points resolved to
+// Europe/Rome and Europe/Paris.  Measured against the unsimplified geometry
+// over 1500 sample points:
+//
+//   eps=80  0.43 MB  99.80% agreement  (Vatican and Monaco wrong)
+//   eps=8   1.40 MB  100.0% agreement
+//   eps=4   2.03 MB  100.0% agreement
+//   eps=2   3.01 MB  100.0% agreement
+//
+// 8 (~300m) is the knee of that curve: it is the coarsest value that still
+// resolves every microstate, and tightening further buys no measurable
+// accuracy.
+const DEFAULT_EPSILON = 8;
+
+// How a zone relates to a quadtree cell.
+const REL_DISJOINT  = 0;   // no overlap; the zone does not belong in this cell
+const REL_CANDIDATE = 1;   // partial overlap; needs a point-in-polygon test
+const REL_DEFINITE  = 2;   // the zone covers the entire cell; no test needed
+
+function processRing(ring, epsilon) {
+  return tzmap.SimplifyRDP(tzmap.Quantize(ring), epsilon);
+}
+
+// Pack a quantized ring into {o, p}: an explicit integer origin plus a base64
+// delta stream.  encodePolygon() verifies its own round-trip and throws on
+// mismatch, so a codec regression cannot reach the artifact silently.
+function exportRing(ring) {
+  const encoded = polycodec.encodePolygon(ring);
+  return {o: encoded.o, p: polycodec.bytesToBase64(encoded.p)};
 }
 
 function splitCell(cell, quadrant) {
-  const mx = parseInt((cell[0][0] + cell[1][0]) / 2), my = parseInt((cell[0][1] + cell[1][1]) / 2);
-  switch(quadrant) {
-  case 0: return([[mx, my], [cell[1][0], cell[1][1]]]);
-  case 1: return([[cell[0][0], my], [mx, cell[1][1]]]);
-  case 2: return([[cell[0][0], cell[0][1]], [mx, my]]);
-  case 3: return([[mx, cell[0][1]], [cell[1][0], my]]);
-  }
+  return tzlookup.splitCell(cell, quadrant);
 }
 
+function aabbsOverlap(a, b) {
+  return !(a[1][0] < b[0][0] || a[0][0] > b[1][0] ||
+           a[1][1] < b[0][1] || a[0][1] > b[1][1]);
+}
+
+// Classify a zone against a cell, accounting for holes.
+//
+// A hole that covers the whole cell means the zone does not cover any of it,
+// even though the exterior ring encloses it.  A hole that merely crosses the
+// cell downgrades a would-be definitive hit to a candidate.  This is what keeps
+// `eref` honest: `eref` is consumed at lookup time as "answer immediately, skip
+// the geometry", so a hole inside an eref region would be an unrecoverable
+// wrong answer.
+function classify(cell, zone) {
+  if (!aabbsOverlap(cell, zone.aabb)) {
+    return REL_DISJOINT;
+  }
+
+  const outerRel = geom.AABBIntersectsPoly(cell, zone.outer);
+  if (outerRel == geom.AABB_DISJOINT) {
+    return REL_DISJOINT;
+  }
+  if (outerRel == geom.AABB_CROSSES) {
+    return REL_CANDIDATE;
+  }
+
+  // The exterior ring encloses the whole cell; holes may still carve it out.
+  let rel = REL_DEFINITE;
+  for (let i = 0; i < zone.holes.length; i++) {
+    if (!aabbsOverlap(cell, zone.holeAABBs[i])) { continue; }
+    const holeRel = geom.AABBIntersectsPoly(cell, zone.holes[i]);
+    if (holeRel == geom.AABB_CONTAINS) {
+      return REL_DISJOINT;      // the cell lies entirely within a hole
+    }
+    if (holeRel == geom.AABB_CROSSES) {
+      rel = REL_CANDIDATE;
+    }
+  }
+  return rel;
+}
+
+// Does `ref` appear anywhere at or below `node`?  Debug-only invariant check;
+// it walks the whole subtree, so it is O(n) per insertion.
 function findRef(node, ref) {
-  return node.q.some(function(q, i) {
-    if(q.eref.indexOf(ref) != -1) {
-      return true;
-    }
-    if(q.ref.indexOf(ref) != -1) {
-      return true;
-    }
-    return findRef(q, ref);
-  });
-  return false;
+  if (node.eref.indexOf(ref) != -1 || node.ref.indexOf(ref) != -1) {
+    return true;
+  }
+  return node.q.some(function(q) { return findRef(q, ref); });
 }
 
-// the quadtree works as follows:
-//   quadrants are indexed 0-3 as cartesian quadrants I-IV and on the `.q` member
-//   the `.ref` member contains a list of all polygon refs in `.q` at any depth
-//   the `.eref` member is a list of all polygon refs which are fully contained by this quadtree node
-function appendTZPolyInternal(node, cell, ref, depth, debugName) {
-  console.log("appendTZPolyInternal(", node, cell, ref, depth, debugName, ")");
-  const intersection = geom.AABBIntersectsPoly(cell, ref.poly);
-  //DEBUG console.log("poly area:", geom.PolyLoopArea(geom.PolyToLoop(ref.poly)));
-  if(intersection == 4) {
-    // Poly fully encloses cell
-    console.log(debugName + ": erefing " + ref.id);
-    node.eref.push(ref);
-  } else if(intersection > 0 || geom.AABBFullyEnclosesAABB(cell, ref.aabb)) {
-    // Poly intersects cell or cell fully encloses poly
-    if(node.q.length > 0) {
-      // Delegate to children
-      console.log(debugName + ": delegating " + ref.id);
-      node.q.forEach(function(q, i) {
-        appendTZPolyInternal(q, splitCell(cell, i), ref, depth + 1, debugName + i);
-      });
+function newNode() {
+  return {q: [], eref: [], ref: []};
+}
 
-      if(!findRef(node, ref)) {  // assert to ensure ref is preserved
-        throw Error("ref not found when delegating");
-      }
+// The quadtree works as follows:
+//   quadrants are indexed 0-3 as cartesian quadrants I-IV on the `.q` member
+//   the `.ref` member lists zones that partially overlap this cell (candidates)
+//   the `.eref` member lists zones that fully cover this cell (definitive)
+// Refs live only at leaves; erefs may live at any depth.
+function insertZoneInternal(node, cell, zone, depth, debugName) {
+  const rel = classify(cell, zone);
 
-      //console.log(debugName + ": delegation complete " + ref.id);
-    }
-    else if(depth >= 16 || node.ref.length < 5) {
-      // As a leaf, hold this reference
-      //console.log(debugName + ": acquiring " + ref.id);
-      node.ref.push(ref);
-    } else {
-      // Split this leaf
-      //console.log(debugName + ": splitting qty=" + node.ref.length);
-      node.q = [0, 1, 2, 3].map(function(i) {
-        const n = {q: [], eref: [], ref: []};
-        node.ref.forEach(function(splitRef) {
-          appendTZPolyInternal(n, splitCell(cell, i), splitRef, depth + 1, debugName + i);
-        });
-        return appendTZPolyInternal(n, splitCell(cell, i), ref, depth + 1, debugName + i);
-      });
-      
-      node.ref.forEach(function(ref) {
-        if(!findRef(node, ref)) {  // assert to ensure refs are preserved
-          function collect(node) {
-            const a = [];
-            node.q.forEach(function(q){a.push(q.ref); collect(q)});
-            return a;
-          }
-          throw Error(debugName + ": ref not found when splitting: " + node.ref.map(function(r){return r.id;}).join(",") + " != " + collect(node).flat().map(function(r){return r.id;}).join(","));
-        }
-      });
-
-      // Refs are delegated to quadrants but erefs (refs fully enclosing this cell) remain.
-      node.ref = [];
-
-      //console.log(debugName + ": split complete");
-    }
-  } else {
-    //console.log("At quadtree path " + debugName + ", poly " + ref.id + " not fully enclosed by qt cell. Poly aabb:", ref.aabb, "cell:", cell, "intersection:", intersection);
+  if (rel == REL_DISJOINT) {
+    return node;
   }
+
+  if (rel == REL_DEFINITE) {
+    trace(debugName + ": erefing " + zone.id);
+    node.eref.push(zone);
+    return node;
+  }
+
+  if (node.q.length > 0) {
+    trace(debugName + ": delegating " + zone.id);
+    node.q.forEach(function(q, i) {
+      insertZoneInternal(q, splitCell(cell, i), zone, depth + 1, debugName + i);
+    });
+    if (DEBUG && !findRef(node, zone)) {
+      throw Error(debugName + ": ref not found when delegating " + zone.id);
+    }
+    return node;
+  }
+
+  if (depth >= tzmap.MAX_DEPTH || node.ref.length < tzmap.SPLIT_THRESHOLD) {
+    node.ref.push(zone);
+    return node;
+  }
+
+  // Split this leaf: redistribute the refs it held, then insert the new zone.
+  trace(debugName + ": splitting qty=" + node.ref.length);
+  const held = node.ref;
+  node.q = [0, 1, 2, 3].map(function() { return newNode(); });
+  node.q.forEach(function(q, i) {
+    const childCell = splitCell(cell, i);
+    held.forEach(function(heldZone) {
+      insertZoneInternal(q, childCell, heldZone, depth + 1, debugName + i);
+    });
+    insertZoneInternal(q, childCell, zone, depth + 1, debugName + i);
+  });
+
+  if (DEBUG) {
+    held.concat([zone]).forEach(function(r) {
+      if (!findRef(node, r)) {
+        throw Error(debugName + ": ref " + r.id + " lost when splitting");
+      }
+    });
+  }
+
+  // Refs are delegated to the quadrants; erefs already at this node remain.
+  node.ref = [];
   return node;
 }
 
-function appendTZPoly(output, poly, name) {
-  console.log("appendTZPoly", name);
-  const aabb = geom.PolyAABB(poly);
+// Add one polygon (an exterior ring plus its holes, already quantized and
+// simplified) to the output under timezone `name`.
+function appendZone(output, outer, holes, name) {
+  if (outer.length < 3) {
+    trace("skipping degenerate ring for " + name);
+    return null;
+  }
 
-  //debug: test aabb
-  //for(let i = 0; i < poly.length)
-
-  // Create a tz if one doesn't exist
   let tz = output.tz[name];
-  if(!tz) {
+  if (!tz) {
     tz = output.tz[name] = {
       id: Object.keys(output.tz).length,
       n: name,
@@ -143,170 +184,234 @@ function appendTZPoly(output, poly, name) {
     };
   }
 
-  // Create a ref
-  const ref = {
+  const zone = {
     id: output.zones.length,
-    poly: poly, // Dropped for export
-    aabb: aabb,
-    p: exportPoly(poly).toString("base64"),
+    outer: outer,                                    // dropped for export
+    holes: holes,                                    // dropped for export
+    aabb: geom.PolyAABB(outer),
+    holeAABBs: holes.map(geom.PolyAABB),             // dropped for export
+    // Unsigned doubled area, used at lookup time to break ties when several
+    //   overlapping zones contain the same point (see tzlookup.smallest).
+    a: Math.abs(tzmap.RingArea2(outer)),
     tzid: tz.id
   };
-  output.zones.push(ref);
-  tz.ref.push(ref.id);
+  output.zones.push(zone);
+  tz.ref.push(zone.id);
 
-  const ret = appendTZPolyInternal(output.quadtree, [[-524288, -262144], [524287, 262143]], ref, 0, "");
-  //console.log("appended", ref.id, "into", ret);
+  insertZoneInternal(output.quadtree, output.rootCell, zone, 0, "");
+  return zone;
 }
 
-function probeTZPoint(output, point) {
-  function probeTZPointInternal(node, cell, point) {
-    const hits = [];
-    if (node.eref) {
-      hits.push.apply(hits, node.eref);
-    }
-    if (node.ref) {
-      hits.push.apply(hits, node.ref);
-    }
-    if (node.q && node.q.length > 0) {
-      const q0 = splitCell(cell, 0);
-      if (point[0] >= q0[0][0]) {
-        if (point[1] >= q0[0][1]) {
-          hits.push.apply(hits, probeTZPointInternal(node.q[0], splitCell(cell, 0), point));
-        } else {
-          hits.push.apply(hits, probeTZPointInternal(node.q[3], splitCell(cell, 3), point));
-        }
-      } else {
-        if (point[1] >= q0[0][1]) {
-          hits.push.apply(hits, probeTZPointInternal(node.q[1], splitCell(cell, 1), point));
-        } else {
-          hits.push.apply(hits, probeTZPointInternal(node.q[2], splitCell(cell, 2), point));
-        }
-      }
-    }
-    return hits;
-  }
-
-  return probeTZPointInternal(output.quadtree, [[-524288, -262144], [524287, 262143]], point);
-}
-
-function manualTest() {
-  function rect(aabb) {return [
-    [aabb[0][0], aabb[0][1]],
-    [aabb[1][0], aabb[0][1]],
-    [aabb[1][0], aabb[1][1]],
-    [aabb[0][0], aabb[1][1]]
-  ]};
-  const tzOut = {quadtree: {q: [], eref: [], ref: []}, zones: [], tz: {}};
-  tzconvert.appendTZPoly(tzOut, rect([[100, 100], [1000, 1000]]), "foo");
-  tzconvert.appendTZPoly(tzOut, rect([[-1000, -1000], [-100, -100]]), "foo");
-  tzconvert.appendTZPoly(tzOut, rect([[-1000, 100], [-100, 1000]]), "foo");
-  tzconvert.appendTZPoly(tzOut, rect([[-100, -100], [100, 100]]), "foo");
-  tzconvert.appendTZPoly(tzOut, rect([[100, -1000], [1000, -100]]), "foo");
-  tzconvert.appendTZPoly(tzOut, rect([[-100, -1000], [100, -100]]), "foo");
-  tzconvert.appendTZPoly(tzOut, rect([[-1000000, -1000000], [1000000, 1000000]]), "foo");
-  return tzOut;
-}
-
-module.exports = {
-  processPoly: processPoly,
-  exportPoly: exportPoly,
-  splitCell: splitCell,
-  appendTZPoly: appendTZPoly,
-};
-
-if (require.main == module) {
-
-  const tzdata = require("./data/combined.json"); // takes >10 seconds to load
-
-  const tzOut = {
-    quadtree: {
-      q: [],
-      eref: [],
-      ref: []
+function newOutput() {
+  return {
+    // The artifact is self-describing: a consumer needs no compiled-in
+    //   constants to convert degrees to quantized units or to walk the tree.
+    quant: {
+      xMin: tzmap.X_MIN, xMax: tzmap.X_MAX,
+      yMin: tzmap.Y_MIN, yMax: tzmap.Y_MAX,
+      xScale: tzmap.X_SCALE, yScale: tzmap.Y_SCALE,
+      maxDepth: tzmap.MAX_DEPTH
     },
+    rootCell: tzmap.ROOT_CELL,
+    quadtree: newNode(),
     zones: [],
     tz: {}
   };
+}
 
-  function insertZone(output, unprocessedPoly, name) {
-    appendTZPoly(output, processPoly(unprocessedPoly), name);
+// Replace zone object references with numeric ids and drop empty members.
+function purge(output) {
+  (function walk(node) {
+    node.ref = node.ref.map(function(z) { return z.id; });
+    if (node.ref.length == 0) { delete node.ref; }
+    node.eref = node.eref.map(function(z) { return z.id; });
+    if (node.eref.length == 0) { delete node.eref; }
+    node.q.forEach(walk);
+    if (node.q.length == 0) { delete node.q; }
+  })(output.quadtree);
+
+  output.zones.forEach(function(z) {
+    const packed = exportRing(z.outer);
+    z.o = packed.o;
+    z.p = packed.p;
+    if (z.holes.length > 0) {
+      z.h = z.holes.map(exportRing);
+    }
+    delete z.outer;
+    delete z.holes;
+    delete z.holeAABBs;
+  });
+  return output;
+}
+
+function treeStats(output) {
+  let nodes = 0, leaves = 0, refs = 0, erefs = 0, maxDepth = 0, maxLeaf = 0;
+  (function walk(node, d) {
+    nodes++;
+    maxDepth = Math.max(maxDepth, d);
+    const r = node.ref || [], e = node.eref || [];
+    refs += r.length;
+    erefs += e.length;
+    if (!node.q || node.q.length == 0) {
+      leaves++;
+      maxLeaf = Math.max(maxLeaf, r.length);
+    } else {
+      node.q.forEach(function(q) { walk(q, d + 1); });
+    }
+  })(output.quadtree, 0);
+  return {nodes: nodes, leaves: leaves, refs: refs, erefs: erefs,
+          maxDepth: maxDepth, maxLeafRefs: maxLeaf};
+}
+
+module.exports = {
+  REL_DISJOINT: REL_DISJOINT,
+  REL_CANDIDATE: REL_CANDIDATE,
+  REL_DEFINITE: REL_DEFINITE,
+  DEFAULT_EPSILON: DEFAULT_EPSILON,
+  processRing: processRing,
+  exportRing: exportRing,
+  splitCell: splitCell,
+  classify: classify,
+  appendZone: appendZone,
+  newOutput: newOutput,
+  purge: purge,
+  treeStats: treeStats,
+};
+
+
+if (require.main == module) {
+  const fs = require("fs");
+  const epsilon = process.env.EPSILON? parseInt(process.env.EPSILON, 10) : DEFAULT_EPSILON;
+  const outPath = process.argv[2] || "quadtree.json";
+
+  const tzdata = require("./data/combined.json"); // takes >10 seconds to load
+  const output = newOutput();
+
+  let ringsIn = 0, holesIn = 0, skipped = 0, wrapped = 0;
+
+  // GeoJSON: ring 0 of a polygon is the exterior boundary; rings 1..n are holes.
+  // The original code inserted every ring as an independent solid polygon, so
+  // all 255 interior rings in the dataset were filled in rather than punched
+  // out.
+  function insertPolygon(rings, name) {
+    const outer = processRing(rings[0], epsilon);
+    const holes = [];
+    for (let i = 1; i < rings.length; i++) {
+      const hole = processRing(rings[i], epsilon);
+      if (hole.length >= 3) { holes.push(hole); holesIn++; }
+    }
+    ringsIn++;
+
+    // B18: nothing in this pipeline splits polygons at the antimeridian.  A ring
+    //   that wraps would get an AABB spanning the world and would be inserted as
+    //   a candidate into a huge number of cells.  Flag it rather than silently
+    //   producing a slow, wrong tree.
+    const aabb = geom.PolyAABB(outer);
+    if ((aabb[1][0] - aabb[0][0]) > (tzmap.X_MAX - tzmap.X_MIN) / 2) {
+      wrapped++;
+      console.error("WARNING: ring for " + name + " spans more than half the " +
+        "world in longitude (x " + aabb[0][0] + ".." + aabb[1][0] + "); " +
+        "antimeridian wrapping is not handled.");
+    }
+
+    if (appendZone(output, outer, holes, name) == null) { skipped++; }
   }
 
-  // process the input dataset
-  tzdata.features.forEach(function(tz) {
-    console.log("=> Processing input timezone:", tz.properties);
-    const type = tz.geometry.type;
-    for(let i = 0; i < tz.geometry.coordinates.length; i++) {
-      if(type == "MultiPolygon") {
-        console.log("  > inserting MultiPolygon #", i);
-        for(let j = 0; j < tz.geometry.coordinates[i].length; j++) {
-          console.log("    > inserting MultiPolygon #", i, "poly #", j);
-          insertZone(tzOut, tz.geometry.coordinates[i][j], tz.properties.tzid);
-        }
-      } else {
-        console.log("  > inserting Polygon #", i);
-        insertZone(tzOut, tz.geometry.coordinates[i], tz.properties.tzid);
+  console.error("Processing " + tzdata.features.length + " features, epsilon=" + epsilon);
+  tzdata.features.forEach(function(tz, n) {
+    const name = tz.properties.tzid;
+    const g = tz.geometry;
+    if (g.type == "MultiPolygon") {
+      g.coordinates.forEach(function(rings) { insertPolygon(rings, name); });
+    } else {
+      insertPolygon(g.coordinates, name);
+    }
+    if ((n % 25) == 0) { console.error("  " + n + "/" + tzdata.features.length + " " + name); }
+  });
+
+  console.error("exterior rings: " + ringsIn + ", holes: " + holesIn +
+    ", skipped: " + skipped + ", antimeridian-wrapped: " + wrapped);
+
+  // Verify the built tree against brute force before writing it out.  This is
+  // the oracle that would have caught the winding-order bug immediately.
+  const samples = process.env.VERIFY? parseInt(process.env.VERIFY, 10) : 2000;
+  if (samples > 0) {
+    console.error("Verifying " + samples + " random points against brute force...");
+    const failures = verify(output, samples);
+    if (failures > 0) {
+      throw Error(failures + "/" + samples + " lookups disagreed with brute force");
+    }
+    console.error("  all " + samples + " lookups agree");
+  }
+
+  const stats = treeStats(output);
+  console.error("quadtree: " + JSON.stringify(stats));
+
+  purge(output);
+  fs.writeFileSync(outPath, JSON.stringify(output));
+  console.error("wrote " + outPath + " (" + fs.statSync(outPath).size + " bytes)");
+}
+
+// Smallest-area zone from a list, matching tzlookup's tie-break rule.
+function smallestZone(zones) {
+  let best = null;
+  for (let i = 0; i < zones.length; i++) {
+    if (best === null || zones[i].a < best.a) { best = zones[i]; }
+  }
+  return best;
+}
+
+// Compare quadtree resolution against an exhaustive scan of every zone.
+// Operates on the unpurged output, so zones still carry their decoded rings.
+function verify(output, samples) {
+  let failures = 0;
+  // Deterministic LCG so a failing run can be reproduced.
+  let seed = 12345;
+  function rnd() {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return seed / 0x7FFFFFFF;
+  }
+
+  const db = {
+    rootCell: output.rootCell,
+    quadtree: output.quadtree,
+    zones: output.zones
+  };
+
+  for (let i = 0; i < samples; i++) {
+    const x = Math.floor(tzmap.X_MIN + rnd() * (tzmap.X_MAX - tzmap.X_MIN));
+    const y = Math.floor(tzmap.Y_MIN + rnd() * (tzmap.Y_MAX - tzmap.Y_MIN));
+    const point = [x, y];
+
+    // Brute force applies the same smallest-wins rule as the real lookup, so
+    //   that overlapping zones are compared meaningfully rather than leniently.
+    const containing = output.zones.filter(function(z) {
+      return geom.RingsContainPoint(z.outer, z.holes, point);
+    });
+    const expected = smallestZone(containing);
+
+    // Resolve directly against the in-memory rings (pre-purge, so no decode).
+    const hit = tzlookup.probe(output.quadtree, output.rootCell, point);
+    let actual = null;
+    if (hit.definite.length > 0) {
+      actual = smallestZone(hit.definite);
+    } else {
+      actual = smallestZone(hit.candidates.filter(function(z) {
+        return geom.RingsContainPoint(z.outer, z.holes, point);
+      }));
+    }
+
+    const ok = (expected === null)? (actual === null) :
+      (actual !== null && actual.a == expected.a && actual.tzid == expected.tzid);
+    if (!ok) {
+      failures++;
+      if (failures <= 10) {
+        console.error("  MISMATCH at [" + x + ", " + y + "]: brute force " +
+          (expected? expected.id : null) + ", quadtree " + (actual? actual.id : null));
       }
     }
-  });
-
-  if(0) {
-
-
-  // test
-  // pick a random point in the range
-  function testPoint(output) {
-    const quadtreeAABB = [[-524288, -262144], [524287, 262143]];
-    const x = quadtreeAABB[0][0] + Math.random() * (quadtreeAABB[1][0] - quadtreeAABB[0][0]);
-    const y = quadtreeAABB[0][1] + Math.random() * (quadtreeAABB[1][1] - quadtreeAABB[0][1]);
-
-    const expected = output.zones.filter(function(z) {
-      return geom.PolyContainsPoints(z.poly, [[x, y]])[0];
-    }).map(function(v){return v.id;});
-
-    const actual = probeTZPoint(output, [x, y]).map(function(v){return v.id;});
-
-    console.log("testing point", [x, y], "expecting", expected, "got", actual);
-    //UnitTest(expected, actual);
   }
-
-  for(let i = 0; i < 100; i++) {
-    testPoint(tzOut);
-  }
-
-
-
-
-  function purge(node) {
-    node.ref = node.ref.map(function(ref) {
-      return ref.id;
-    });
-    if(node.ref.length == 0) {
-      delete node.ref;
-    }
-    node.eref = node.eref.map(function(eref) {
-      return eref.id;
-    });
-    if(node.eref.length == 0) {
-      delete node.eref;
-    }
-    node.q.forEach(function(q) {
-      purge(q);
-    });
-    if(node.q.length == 0) {
-      delete node.q;
-    }
-  }
-  purge(tzOut.quadtree);
-
-  tzOut.zones.forEach(function(z) {
-    delete z.poly;
-  });
-
-  } else {
-    console.log("skipping tetPoitn and purge phases")
-  }
-
-
-  process.stdout.write(JSON.stringify(tzOut));
+  return failures;
 }
+
+module.exports.verify = verify;

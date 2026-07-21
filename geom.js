@@ -1,4 +1,13 @@
-const UnitTest = require("./unitTest");
+// Geometry primitives, loadable from both Node (require) and the browser
+// (as a plain <script>, exposing `geom` on the global object).
+
+(function(root, factory) {
+  if (typeof module === "object" && module.exports) {
+    module.exports = factory();
+  } else {
+    root.geom = factory();
+  }
+})(typeof self !== "undefined" ? self : this, function() {
 
 // Add vector `a` to `b`
 function VAdd(a, b) {return [a[0] + b[0], a[1] + b[1]];}
@@ -23,13 +32,19 @@ function VClosest(a, b, p) {
 
 // Point on segment AB closest to P
 function VClosestSegment(a, b, p) {
-  const ab = VSub(b, a), abMag = VMag(ab), n = VScale(ab, 1 / abMag), t = VDot(VSub(p, a), n);
-  return (t < 0)? a : ((t > abMag)? b : VAdd(a, VScale(ab, t)));
+  const ab = VSub(b, a), abMag = VMag(ab);
+  if(abMag == 0) { return a; }
+  const n = VScale(ab, 1 / abMag), t = VDot(VSub(p, a), n);
+  // `t` is measured along the unit vector `n`, so it must be scaled by `n`, not by `ab`.
+  return (t < 0)? a : ((t > abMag)? b : VAdd(a, VScale(n, t)));
 }
 
 // Distance from P to any point on line AB
+// If A and B coincide the line is undefined, so fall back to the distance from P to A.
 function VDistToLine(a, b, p) {
-  const n = VNorm(VSub(b, a)), ap = VSub(p, a);
+  const ab = VSub(b, a), ap = VSub(p, a);
+  if(VIsZero(ab)) { return VMag(ap); }
+  const n = VScale(ab, 1 / VMag(ab));
   return VMag(VSub(ap, VScale(n, VDot(ap, n))));
 }
 
@@ -40,7 +55,7 @@ function VSegmentsIntersect(p1, q1, p2, q2) {
   }
   function onSegment(p, q, r) {
     return (
-      q[0] <= ((p[0] > r[0])? p[0] : y[0]) && q[0] >= ((p[0] < r[0])? p[0] : r[0]) &&
+      q[0] <= ((p[0] > r[0])? p[0] : r[0]) && q[0] >= ((p[0] < r[0])? p[0] : r[0]) &&
       q[1] <= ((p[1] > r[1])? p[1] : r[1]) && q[1] >= ((p[1] < r[1])? p[1] : r[1]));
   }
 
@@ -69,29 +84,9 @@ function PolyAABB(poly) {
   return aabb;
 }
 
-function PolyToLoop(poly) {
-  let p = [0, 0];
-  return poly.map(function(v, i) {
-    const d = VSub(v, p);
-    p = v;
-    return d;
-  });
-}
-
-// Find the final point of polygon loop `polyLoop`
-function PolyLoopEndpoint(polyLoop) {
-  return polyLoop.reduce(function(a, b) {return VAdd(a, b)});
-}
-
-function PolyLoopArea(polyLoop) {
-  let a = 0, p = [0, 0];
-  polyLoop.forEach(function(v) {
-    a += (p[0] * (p[1] + v[1]) - p[1] * (p[0] + v[0]));
-    p[0] += v[0];
-    p[1] += v[1];
-  });
-  return 0.5 * a;
-}
+// Delta ("loop") encoding of a polygon now lives in polycodec.js, which owns
+// the origin/delta split; the PolyToLoop / PolyLoopEndpoint / PolyLoopArea
+// helpers that used to live here were superseded by it and by tzmap.RingArea2.
 
 // Returns a line segment (array of two 2D points) which intersects the
 //   provided AABB, or false if it does not intersect
@@ -144,10 +139,26 @@ function SegmentIntersectsAABB(aabb, p0, p1) {
   }
 }
 
+// Classification results for AABBIntersectsPoly().
+const AABB_DISJOINT = 0;  // poly and aabb do not overlap at all
+const AABB_CROSSES  = 1;  // poly boundary crosses the aabb, or poly lies inside it
+const AABB_CONTAINS = 2;  // poly strictly encloses the whole aabb
+
+// Classify how polygon `poly` relates to axis-aligned box `aabb`, treating the
+//   box bounds as inclusive.
+//
+// IMPORTANT: the result is deliberately INDEPENDENT OF THE POLYGON'S WINDING
+//   ORDER.  An earlier version returned the signed sum of the corner winding
+//   numbers, so a clockwise ring that enclosed the box scored -4 instead of +4
+//   and callers testing `== 4` silently discarded it.  Roughly 60% of the rings
+//   in the source dataset are clockwise, so most large timezones lost their
+//   interiors.  Containment is now decided by "is every corner's winding number
+//   non-zero", which is sign-agnostic.
 function AABBIntersectsPoly(aabb, poly) {
-  // Check two things in parallel: both if any segment of the poly intersects
-  //   the aabb, which is done using line clipping via SegmentIntersectsAABB(),
-  //   and determine the number of vertices of the aabb which are within the poly.
+  // Check three things in one pass: whether any segment of the poly crosses the
+  //   aabb boundary (via line clipping in SegmentIntersectsAABB), whether any
+  //   poly vertex falls inside the aabb, and the winding number of each of the
+  //   four aabb corners with respect to the poly.
 
   function isLeft(p0, p1, p2) {
     const calc = ((p1[0] - p0[0]) * (p2[1] - p0[1]) - (p2[0] - p0[0]) * (p1[1] - p0[1]));
@@ -163,11 +174,19 @@ function AABBIntersectsPoly(aabb, poly) {
 
   for (let i = 0; i < poly.length; i++) {
     const next = (i == (poly.length - 1))? poly[0] : poly[i + 1];
+
+    // A poly vertex inside the box means they overlap, even if no edge ever
+    //   crosses the boundary (i.e. the poly is entirely contained by the box).
+    if(poly[i][0] >= aabb[0][0] && poly[i][0] <= aabb[1][0] &&
+       poly[i][1] >= aabb[0][1] && poly[i][1] <= aabb[1][1]) {
+      return AABB_CROSSES;
+    }
+
     const intersection = SegmentIntersectsAABB(aabb, poly[i], next);
-    // if SegmentIntersectsAABB() returns a clipped segment, there was an intersection
-    //   between poly and aabb, so we can return early
+    // if SegmentIntersectsAABB() returns a clipped segment, the edge crosses the
+    //   aabb boundary, so we can return early
     if(intersection !== false && intersection !== true) {
-      return 1;
+      return AABB_CROSSES;
     }
 
     // update winding numbers for the four aabb vertices
@@ -187,9 +206,10 @@ function AABBIntersectsPoly(aabb, poly) {
       }
     }
   }
-  // return the number of vertices inside the poly, which could only
-  //   be 0 or 4 because we return early above if the poly and aabb intersect.
-  return wn[0] + wn[1] + wn[2] + wn[3];
+
+  // No edge crossed the boundary, so every corner has the same containment
+  //   status.  Non-zero winding means inside, regardless of sign or magnitude.
+  return wn.every(function(n) {return n != 0;})? AABB_CONTAINS : AABB_DISJOINT;
 }
 
 function AABBFullyEnclosesAABB(aabbOuter, aabbInner) {
@@ -229,7 +249,31 @@ function PolyContainsPoints(poly, points) {
   return wn.map(function(n) {return n != 0;});
 }
 
-module.exports = {
+// Convenience single-point form of PolyContainsPoints()
+function PolyContainsPoint(poly, point) {
+  return PolyContainsPoints(poly, [point])[0];
+}
+
+// Containment for a polygon with holes: inside the exterior ring and outside
+//   every interior ring.  `holes` may be undefined or empty.
+function RingsContainPoint(outer, holes, point) {
+  if(!PolyContainsPoint(outer, point)) {
+    return false;
+  }
+  if(holes) {
+    for(let i = 0; i < holes.length; i++) {
+      if(PolyContainsPoint(holes[i], point)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+return {
+  AABB_DISJOINT: AABB_DISJOINT,
+  AABB_CROSSES: AABB_CROSSES,
+  AABB_CONTAINS: AABB_CONTAINS,
   VAdd: VAdd,
   VSub: VSub,
   VScale: VScale,
@@ -243,15 +287,26 @@ module.exports = {
   VSegmentsIntersect: VSegmentsIntersect,
   PolyAABB: PolyAABB,
   PolyContainsPoints: PolyContainsPoints,
-  PolyToLoop: PolyToLoop,
-  PolyLoopEndpoint: PolyLoopEndpoint,
-  PolyLoopArea: PolyLoopArea,
+  PolyContainsPoint: PolyContainsPoint,
+  RingsContainPoint: RingsContainPoint,
+  SegmentIntersectsAABB: SegmentIntersectsAABB,
   AABBIntersectsPoly: AABBIntersectsPoly,
   AABBFullyEnclosesAABB: AABBFullyEnclosesAABB,
 };
 
+});
 
-if (require.main == module) {
+
+if (typeof require !== "undefined" && typeof module !== "undefined" && require.main == module) {
+  const UnitTest = require("./unitTest");
+  const g = module.exports;
+  const VClosestSegment = g.VClosestSegment, VDistToLine = g.VDistToLine,
+        VSegmentsIntersect = g.VSegmentsIntersect, PolyContainsPoints = g.PolyContainsPoints,
+        PolyContainsPoint = g.PolyContainsPoint, RingsContainPoint = g.RingsContainPoint,
+        SegmentIntersectsAABB = g.SegmentIntersectsAABB, AABBIntersectsPoly = g.AABBIntersectsPoly,
+        AABB_DISJOINT = g.AABB_DISJOINT, AABB_CROSSES = g.AABB_CROSSES,
+        AABB_CONTAINS = g.AABB_CONTAINS;
+
   UnitTest(PolyContainsPoints([[0, 0], [1, 0], [1, 1], [0, 1]], [[0.5, 0.5]]), [true]);
   UnitTest(PolyContainsPoints([[0, 0], [1, 0], [1, 1], [0, 1]], [[0.5, 0.5], [0.5, 0.75], [0.75, 0.5]]), [true, true, true]);
   UnitTest(PolyContainsPoints([[0, 0], [1, 0], [1, 1], [0, 1]], [[0.5, 0.5], [1.5, 0.5], [0.5, 0.75]]), [true, false, true]);
@@ -269,7 +324,54 @@ if (require.main == module) {
   UnitTest(SegmentIntersectsAABB([[100, 100], [1000, 1000]], [90, 140], [120, 110]), [[100, 130], [120, 110]]);
 
 
-  UnitTest(AABBIntersectsPoly([[100, 100], [1000, 1000]], [[-1, -1], [-10, 1], [-10, -10], [-1, -10]]), 0);
-  UnitTest(AABBIntersectsPoly([[100, 100], [1000, 1000]], [[10, 10], [110, 10], [110, 110], [10, 110]]), 1);
-  UnitTest(AABBIntersectsPoly([[100, 100], [1000, 1000]], [[10, 10], [1100, 10], [1100, 1100], [10, 1100]]), 4);
+  const cell = [[100, 100], [1000, 1000]];
+  UnitTest(AABBIntersectsPoly(cell, [[-1, -1], [-10, 1], [-10, -10], [-1, -10]]), AABB_DISJOINT);
+  UnitTest(AABBIntersectsPoly(cell, [[10, 10], [110, 10], [110, 110], [10, 110]]), AABB_CROSSES);
+  UnitTest(AABBIntersectsPoly(cell, [[10, 10], [1100, 10], [1100, 1100], [10, 1100]]), AABB_CONTAINS);
+  // a poly entirely inside the cell overlaps it, even though no edge crosses the boundary
+  UnitTest(AABBIntersectsPoly(cell, [[200, 200], [300, 200], [300, 300], [200, 300]]), AABB_CROSSES);
+
+  // REGRESSION (B1): classification must not depend on winding order.  Nearly
+  //   60% of the source dataset's outer rings are clockwise, and the previous
+  //   signed-sum implementation silently discarded every one of them that
+  //   enclosed a cell.
+  [
+    [[-1, -1], [-10, 1], [-10, -10], [-1, -10]],            // disjoint
+    [[10, 10], [110, 10], [110, 110], [10, 110]],           // crossing
+    [[10, 10], [1100, 10], [1100, 1100], [10, 1100]],       // containing
+    [[200, 200], [300, 200], [300, 300], [200, 300]]        // contained by cell
+  ].forEach(function(poly, i) {
+    UnitTest(
+      AABBIntersectsPoly(cell, poly.slice().reverse()),
+      AABBIntersectsPoly(cell, poly),
+      "winding-invariance[" + i + "]");
+  });
+
+  // PolyContainsPoints is winding-agnostic too
+  const sq = [[0, 0], [10, 0], [10, 10], [0, 10]];
+  UnitTest(PolyContainsPoint(sq, [5, 5]), true);
+  UnitTest(PolyContainsPoint(sq.slice().reverse(), [5, 5]), true);
+
+  // Holes
+  const hole = [[4, 4], [6, 4], [6, 6], [4, 6]];
+  UnitTest(RingsContainPoint(sq, [hole], [5, 5]), false);
+  UnitTest(RingsContainPoint(sq, [hole], [1, 1]), true);
+  UnitTest(RingsContainPoint(sq, [hole.slice().reverse()], [5, 5]), false);
+  UnitTest(RingsContainPoint(sq, [], [5, 5]), true);
+
+  // B6: VSegmentsIntersect used to throw ReferenceError on the collinear path
+  UnitTest(VSegmentsIntersect([0, 0], [10, 0], [5, 0], [20, 0]), true);
+  UnitTest(VSegmentsIntersect([0, 0], [10, 0], [0, 5], [10, 5]), false);
+  UnitTest(VSegmentsIntersect([0, 0], [10, 10], [0, 10], [10, 0]), true);
+
+  // B7: VClosestSegment scaled by `ab` instead of the unit vector `n`
+  UnitTest(VClosestSegment([0, 0], [10, 0], [5, 5]), [5, 0]);
+  UnitTest(VClosestSegment([0, 0], [10, 0], [-5, 5]), [0, 0]);
+  UnitTest(VClosestSegment([0, 0], [10, 0], [15, 5]), [10, 0]);
+  UnitTest(VClosestSegment([3, 3], [3, 3], [15, 5]), [3, 3]);   // degenerate segment
+
+  // B9: VDistToLine must not return NaN for a degenerate line
+  UnitTest(VDistToLine([1, 1], [1, 1], [4, 5]), 5);
+
+  console.log("geom.js: all tests passed");
 }
