@@ -8,7 +8,7 @@ const UnitTest = require("./unitTest");
 // during a real build (the original unconditionally console.log'd the entire
 // subtree on every recursive call, which dominated runtime by orders of
 // magnitude).  Enable with DEBUG=1.
-const DEBUG = !!process.env.DEBUG;
+const DEBUG = !!process.env.DEBUG || process.argv.indexOf("--debug") != -1;
 
 function trace() {
   if (DEBUG) { console.error.apply(console, arguments); }
@@ -95,80 +95,81 @@ function classify(cell, zone) {
   return rel;
 }
 
-// Does `ref` appear anywhere at or below `node`?  Debug-only invariant check;
-// it walks the whole subtree, so it is O(n) per insertion.
-function findRef(node, ref) {
-  if (node.eref.indexOf(ref) != -1 || node.ref.indexOf(ref) != -1) {
-    return true;
-  }
-  return node.q.some(function(q) { return findRef(q, ref); });
-}
-
 function newNode() {
   return {q: [], eref: [], ref: []};
+}
+
+// ---------------------------------------------------------------------------
+// Lookup cost model
+// ---------------------------------------------------------------------------
+//
+// The worst-case compute complexity of resolving any point that lands in a leaf,
+// counted in abstract "ops":
+//
+//   traversal steps    -- descending one quadtree level          -- 1 op each
+//   vertex comparisons -- one edge of one candidate's ring, in   -- 2 ops each
+//                         the localized point-in-polygon test
+//
+// A lookup descends `depth` levels, then tests every candidate at the leaf
+// against only the ring edges that pass through the cell (eref zones need no
+// test).  The test has no early-out, so the worst-case vertex-comparison count
+// is point-independent: the sum of localized edge counts over all candidates.
+//
+//   cost(leaf) = depth * TRAVERSAL_OP + localizedEdges * VERTEX_OP
+//
+// This is what the subdivider drives down: split a leaf whenever its cost
+// exceeds the op limit.  (A later size cost model can slot in alongside this
+// one to optimize the compressed artifact instead.)
+const TRAVERSAL_OP = 1;
+const VERTEX_OP = 2;
+
+// Count edges of `ring` that intersect `cell`; edge i runs from vertex i to
+// vertex (i+1) mod n.  This is the vertex-comparison count a localized test
+// performs for this ring in this cell.
+function countEdgesInCell(ring, cell) {
+  let c = 0;
+  const n = ring.length;
+  for (let i = 0; i < n; i++) {
+    if (geom.SegmentIntersectsAABB(cell, ring[i], ring[(i + 1) % n]) !== false) {
+      c++;
+    }
+  }
+  return c;
+}
+
+// Vertex comparisons a lookup performs for one candidate zone in one cell:
+// outer-ring edges plus edges of any hole that reaches the cell.
+function localizedEdgeCount(zone, cell) {
+  let n = countEdgesInCell(zone.outer, cell);
+  for (let h = 0; h < zone.holes.length; h++) {
+    if (aabbsOverlap(cell, zone.holeAABBs[h])) {
+      n += countEdgesInCell(zone.holes[h], cell);
+    }
+  }
+  return n;
+}
+
+// Worst-case lookup cost, in ops, for a leaf holding `refs` (zone objects) at
+// `cell` and `depth`.
+function leafCost(refs, cell, depth) {
+  let edges = 0;
+  for (let i = 0; i < refs.length; i++) {
+    edges += localizedEdgeCount(refs[i], cell);
+  }
+  return depth * TRAVERSAL_OP + edges * VERTEX_OP;
 }
 
 // The quadtree works as follows:
 //   quadrants are indexed 0-3 as cartesian quadrants I-IV on the `.q` member
 //   the `.ref` member lists zones that partially overlap this cell (candidates)
 //   the `.eref` member lists zones that fully cover this cell (definitive)
-// Refs live only at leaves; erefs may live at any depth.
-function insertZoneInternal(node, cell, zone, depth, debugName) {
-  const rel = classify(cell, zone);
-
-  if (rel == REL_DISJOINT) {
-    return node;
-  }
-
-  if (rel == REL_DEFINITE) {
-    trace(debugName + ": erefing " + zone.id);
-    node.eref.push(zone);
-    return node;
-  }
-
-  if (node.q.length > 0) {
-    trace(debugName + ": delegating " + zone.id);
-    node.q.forEach(function(q, i) {
-      insertZoneInternal(q, splitCell(cell, i), zone, depth + 1, debugName + i);
-    });
-    if (DEBUG && !findRef(node, zone)) {
-      throw Error(debugName + ": ref not found when delegating " + zone.id);
-    }
-    return node;
-  }
-
-  if (depth >= tzmap.MAX_DEPTH || node.ref.length < tzmap.SPLIT_THRESHOLD) {
-    node.ref.push(zone);
-    return node;
-  }
-
-  // Split this leaf: redistribute the refs it held, then insert the new zone.
-  trace(debugName + ": splitting qty=" + node.ref.length);
-  const held = node.ref;
-  node.q = [0, 1, 2, 3].map(function() { return newNode(); });
-  node.q.forEach(function(q, i) {
-    const childCell = splitCell(cell, i);
-    held.forEach(function(heldZone) {
-      insertZoneInternal(q, childCell, heldZone, depth + 1, debugName + i);
-    });
-    insertZoneInternal(q, childCell, zone, depth + 1, debugName + i);
-  });
-
-  if (DEBUG) {
-    held.concat([zone]).forEach(function(r) {
-      if (!findRef(node, r)) {
-        throw Error(debugName + ": ref " + r.id + " lost when splitting");
-      }
-    });
-  }
-
-  // Refs are delegated to the quadrants; erefs already at this node remain.
-  node.ref = [];
-  return node;
-}
+// Refs live only at leaves; erefs may live at any depth.  The tree is built by
+// subdivide(): every zone starts as a candidate of the root leaf, which is then
+// split top-down wherever the cost model says a lookup would be too expensive.
 
 // Add one polygon (an exterior ring plus its holes, already quantized and
-// simplified) to the output under timezone `name`.
+// simplified) to the output under timezone `name`, as a candidate of the root
+// leaf.  subdivide() turns the flat root into a tree.
 function appendZone(output, outer, holes, name) {
   if (outer.length < 3) {
     trace("skipping degenerate ring for " + name);
@@ -198,8 +199,126 @@ function appendZone(output, outer, holes, name) {
   output.zones.push(zone);
   tz.ref.push(zone.id);
 
-  insertZoneInternal(output.quadtree, output.rootCell, zone, 0, "");
+  // Every zone overlaps the root cell (the whole world) and none covers it, so
+  //   all zones begin as root candidates.
+  output.quadtree.ref.push(zone);
   return zone;
+}
+
+// A binary max-heap of leaf entries keyed by cost, so the subdivider can always
+// work on the currently most expensive leaf.
+function MaxHeap() {
+  this.a = [];
+}
+MaxHeap.prototype.size = function() { return this.a.length; };
+MaxHeap.prototype.push = function(e) {
+  const a = this.a;
+  a.push(e);
+  let i = a.length - 1;
+  while (i > 0) {
+    const p = (i - 1) >> 1;
+    if (a[p].cost >= a[i].cost) { break; }
+    const t = a[p]; a[p] = a[i]; a[i] = t;
+    i = p;
+  }
+};
+MaxHeap.prototype.peek = function() { return this.a[0]; };
+MaxHeap.prototype.pop = function() {
+  const a = this.a, top = a[0], last = a.pop();
+  if (a.length > 0) {
+    a[0] = last;
+    let i = 0;
+    for (;;) {
+      const l = 2 * i + 1, r = l + 1;
+      let m = i;
+      if (l < a.length && a[l].cost > a[m].cost) { m = l; }
+      if (r < a.length && a[r].cost > a[m].cost) { m = r; }
+      if (m == i) { break; }
+      const t = a[m]; a[m] = a[i]; a[i] = t;
+      i = m;
+    }
+  }
+  return top;
+};
+
+// Build the four children of a leaf without attaching them: classify each of the
+// leaf's candidate zones into the child cells (dropping those a child does not
+// touch, erefing those a child fully covers) and cost each child.  Returns the
+// four child entries.
+function buildChildren(refs, cell, depth) {
+  return [0, 1, 2, 3].map(function(i) {
+    const childCell = splitCell(cell, i);
+    const child = newNode();
+    for (let k = 0; k < refs.length; k++) {
+      const rel = classify(childCell, refs[k]);
+      if (rel == REL_DEFINITE) { child.eref.push(refs[k]); }
+      else if (rel == REL_CANDIDATE) { child.ref.push(refs[k]); }
+    }
+    return {
+      node: child, cell: childCell, depth: depth + 1,
+      cost: leafCost(child.ref, childCell, depth + 1)
+    };
+  });
+}
+
+// Subdivide the (currently flat) root into a quadtree driven by the cost model.
+//
+// Greedy: repeatedly take the most expensive leaf and split it, until every leaf
+// is within `opLimit` ops or cannot be improved.  Two limits stop the descent:
+//
+//   - opLimit   : the target -- a leaf over this many ops is a split candidate.
+//   - maxSplits : a hard cap on the number of splits, which TAKES PRECEDENCE
+//                 over opLimit.  Because the worst leaf is always split first,
+//                 a limited budget is spent where it reduces cost the most,
+//                 letting the user trade artifact size against lookup speed.
+//
+// A leaf that is already at MAX_DEPTH cannot be split; it is set aside even if
+// still over budget (a cell cannot subdivide forever).  There is deliberately no
+// "does splitting help?" guard: because deeper cells cost +1 per level, one
+// split sometimes does not lower cost by itself yet is the necessary step toward
+// splits that do (e.g. when every candidate first funnels into one child).  At a
+// sane op limit only edge-heavy leaves are ever split, and splitting those
+// always distributes their edges; only a pathologically low limit subdivides
+// low-edge features (tripoints) all the way to MAX_DEPTH, which is the user's
+// explicit "maximize speed" trade and is bounded by MAX_DEPTH regardless.
+function subdivide(output, opLimit, maxSplits) {
+  const heap = new MaxHeap();
+  heap.push({
+    node: output.quadtree, cell: output.rootCell, depth: 0,
+    cost: leafCost(output.quadtree.ref, output.rootCell, 0)
+  });
+
+  let splits = 0, atMaxDepth = 0, overLimit = 0;
+
+  while (heap.size() > 0) {
+    if (heap.peek().cost <= opLimit) { break; }          // worst leaf is within budget
+    if (maxSplits != null && splits >= maxSplits) { break; }  // budget exhausted (precedence)
+
+    const leaf = heap.pop();
+    if (leaf.depth >= tzmap.MAX_DEPTH) { atMaxDepth++; continue; }  // cannot split further
+
+    // An edgeless leaf (no candidates -- its cost is pure traversal depth) can
+    //   never be improved by splitting, which would only add depth.  This also
+    //   stops an op limit set below MAX_DEPTH from recursively splitting empty
+    //   cells forever.  A sane op limit exceeds MAX_DEPTH so this never fires.
+    if (leaf.node.ref.length == 0) { overLimit++; continue; }
+
+    // Commit: the leaf becomes internal.  Candidates move to the children; any
+    //   erefs already at this node stay (they cover every child too).
+    const children = buildChildren(leaf.node.ref, leaf.cell, leaf.depth);
+    leaf.node.q = children.map(function(c) { return c.node; });
+    leaf.node.ref = [];
+    splits++;
+    for (let i = 0; i < 4; i++) { heap.push(children[i]); }
+  }
+
+  // Leaves still over budget when we stopped: either at MAX_DEPTH (counted
+  //   above) or left in the heap because the split budget ran out.
+  while (heap.size() > 0) {
+    if (heap.pop().cost > opLimit) { overLimit++; }
+  }
+
+  return {splits: splits, atMaxDepth: atMaxDepth, overLimit: overLimit};
 }
 
 function newOutput() {
@@ -317,9 +436,14 @@ function purge(output) {
   return output;
 }
 
-function treeStats(output) {
+// Tree statistics, including the lookup cost model.  The cost fields require
+// node.ref to still hold zone objects (pre-annotate / pre-purge); when refs have
+// already been annotated to candidate objects the cost fields are reported as 0,
+// since the geometry needed to recompute cost is no longer on the node.
+function treeStats(output, opLimit) {
   let nodes = 0, leaves = 0, refs = 0, erefs = 0, maxDepth = 0, maxLeaf = 0;
-  (function walk(node, d) {
+  let maxCost = 0, overLimit = 0;
+  (function walk(node, cell, d) {
     nodes++;
     maxDepth = Math.max(maxDepth, d);
     const r = node.ref || [], e = node.eref || [];
@@ -328,12 +452,20 @@ function treeStats(output) {
     if (!node.q || node.q.length == 0) {
       leaves++;
       maxLeaf = Math.max(maxLeaf, r.length);
+      // leafCost needs zone objects (they carry `.outer`); skip if annotated.
+      if (r.length == 0 || r[0].outer) {
+        const cost = leafCost(r, cell, d);
+        maxCost = Math.max(maxCost, cost);
+        if (opLimit != null && cost > opLimit) { overLimit++; }
+      }
     } else {
-      node.q.forEach(function(q) { walk(q, d + 1); });
+      node.q.forEach(function(q, i) { walk(q, splitCell(cell, i), d + 1); });
     }
-  })(output.quadtree, 0);
-  return {nodes: nodes, leaves: leaves, refs: refs, erefs: erefs,
-          maxDepth: maxDepth, maxLeafRefs: maxLeaf};
+  })(output.quadtree, output.rootCell, 0);
+  const stats = {nodes: nodes, leaves: leaves, refs: refs, erefs: erefs,
+                 maxDepth: maxDepth, maxLeafRefs: maxLeaf, maxLeafCost: maxCost};
+  if (opLimit != null) { stats.leavesOverLimit = overLimit; }
+  return stats;
 }
 
 module.exports = {
@@ -341,12 +473,17 @@ module.exports = {
   REL_CANDIDATE: REL_CANDIDATE,
   REL_DEFINITE: REL_DEFINITE,
   DEFAULT_EPSILON: DEFAULT_EPSILON,
+  TRAVERSAL_OP: TRAVERSAL_OP,
+  VERTEX_OP: VERTEX_OP,
   processRing: processRing,
   exportRing: exportRing,
   splitCell: splitCell,
   classify: classify,
+  localizedEdgeCount: localizedEdgeCount,
+  leafCost: leafCost,
   appendZone: appendZone,
   newOutput: newOutput,
+  subdivide: subdivide,
   annotateLeaves: annotateLeaves,
   purge: purge,
   treeStats: treeStats,
@@ -355,8 +492,37 @@ module.exports = {
 
 if (require.main == module) {
   const fs = require("fs");
-  const epsilon = process.env.EPSILON? parseInt(process.env.EPSILON, 10) : DEFAULT_EPSILON;
-  const outPath = process.argv[2] || "quadtree.json";
+
+  // CLI: node tzconvert.js [options] [output.json]
+  //   --max-ops=N     lookup cost budget per leaf; leaves over it are split   (default 500)
+  //   --max-splits=N  hard cap on total leaf splits; TAKES PRECEDENCE over    (default: unlimited)
+  //                   --max-ops, so the user can trade artifact size vs speed
+  //   --epsilon=N     simplification tolerance in quantized units             (default 8)
+  //   --verify=N      random points cross-checked against brute force; 0 off  (default 3000)
+  //   --debug         enable tracing and invariant checks
+  function argFlag(name) {
+    return process.argv.indexOf("--" + name) != -1;
+  }
+  function argVal(name, envName, dflt) {
+    const pfx = "--" + name + "=";
+    for (let i = 2; i < process.argv.length; i++) {
+      if (process.argv[i].indexOf(pfx) == 0) { return parseInt(process.argv[i].slice(pfx.length), 10); }
+    }
+    if (envName && process.env[envName]) { return parseInt(process.env[envName], 10); }
+    return dflt;
+  }
+
+  const epsilon = argVal("epsilon", "EPSILON", DEFAULT_EPSILON);
+  const opLimit = argVal("max-ops", "MAXOPS", 500);
+  const maxSplitsRaw = argVal("max-splits", "MAXSPLITS", -1);
+  const maxSplits = (maxSplitsRaw < 0) ? null : maxSplitsRaw;   // null = unlimited
+  const samples = argVal("verify", "VERIFY", 3000);
+  const positional = process.argv.slice(2).filter(function(a) { return a.indexOf("--") != 0; });
+  const outPath = positional[0] || "quadtree.json";
+
+  console.error("options: max-ops=" + opLimit +
+    ", max-splits=" + (maxSplits == null ? "unlimited" : maxSplits) +
+    ", epsilon=" + epsilon + ", verify=" + samples + ", out=" + outPath);
 
   const tzdata = require("./data/combined.json"); // takes >10 seconds to load
   const output = newOutput();
@@ -406,6 +572,17 @@ if (require.main == module) {
   console.error("exterior rings: " + ringsIn + ", holes: " + holesIn +
     ", skipped: " + skipped + ", antimeridian-wrapped: " + wrapped);
 
+  // Build the tree: split leaves top-down until each is within the op budget (or
+  // the split budget runs out).
+  console.error("subdividing (max-ops=" + opLimit + ", max-splits=" +
+    (maxSplits == null ? "unlimited" : maxSplits) + ")...");
+  const sub = subdivide(output, opLimit, maxSplits);
+  console.error("subdivision: " + JSON.stringify(sub));
+
+  // Report tree + cost stats now, while node.ref still holds zone objects.
+  const stats = treeStats(output, opLimit);
+  console.error("quadtree: " + JSON.stringify(stats));
+
   // Attach per-leaf edge subsets so lookups test only the ring edges that pass
   // through each leaf cell.
   const annot = annotateLeaves(output);
@@ -414,7 +591,6 @@ if (require.main == module) {
   // Verify the built tree against brute force before writing it out.  This runs
   // after annotation so it exercises the localized lookup, and is the oracle
   // that would have caught the winding-order bug immediately.
-  const samples = process.env.VERIFY? parseInt(process.env.VERIFY, 10) : 2000;
   if (samples > 0) {
     console.error("Verifying " + samples + " random points against brute force...");
     const failures = verify(output, samples);
@@ -423,9 +599,6 @@ if (require.main == module) {
     }
     console.error("  all " + samples + " lookups agree");
   }
-
-  const stats = treeStats(output);
-  console.error("quadtree: " + JSON.stringify(stats));
 
   purge(output);
   fs.writeFileSync(outPath, JSON.stringify(output));

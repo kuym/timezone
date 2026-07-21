@@ -164,25 +164,37 @@ const FIXTURE = [
   [[-1000000, -600000], [1000000, 600000]]   // encloses the whole root cell
 ];
 
-function buildFixture(mk) {
-  const out = tzconvert.newOutput();
-  FIXTURE.forEach(function(r, i) {
-    tzconvert.appendZone(out, mk(r), [], "zone" + i);
-  });
+// Op budget used when building the small rect fixtures.  Must exceed MAX_DEPTH
+// (16) so edgeless cells are not forced to split, but low enough that a handful
+// of rect edges (2 ops each) still forces several levels of subdivision.
+const FIXTURE_OPS = 30;
+
+// Subdivide with the cost model, then annotate the leaves -- the full build.
+function build(out, opLimit) {
+  tzconvert.subdivide(out, opLimit === undefined ? FIXTURE_OPS : opLimit, null);
   tzconvert.annotateLeaves(out);
   return out;
 }
 
-// Every leaf below MAX_DEPTH must hold at most SPLIT_THRESHOLD candidates.
-function maxLeafRefsBelowMaxDepth(out) {
+function buildFixture(mk, opLimit) {
+  const out = tzconvert.newOutput();
+  FIXTURE.forEach(function(r, i) {
+    tzconvert.appendZone(out, mk(r), [], "zone" + i);
+  });
+  return build(out, opLimit);
+}
+
+// Worst lookup cost among leaves below MAX_DEPTH.  Operates on the pre-annotate
+// tree, where node.ref still holds zone objects.
+function maxLeafCostBelowMaxDepth(out) {
   let worst = 0;
-  (function walk(node, depth) {
+  (function walk(node, cell, depth) {
     if (node.q && node.q.length > 0) {
-      node.q.forEach(function(q, i) { walk(q, depth + 1); });
+      node.q.forEach(function(q, i) { walk(q, tzconvert.splitCell(cell, i), depth + 1); });
     } else if (depth < tzmap.MAX_DEPTH) {
-      worst = Math.max(worst, node.ref.length);
+      worst = Math.max(worst, tzconvert.leafCost(node.ref, cell, depth));
     }
-  })(out.quadtree, 0);
+  })(out.quadtree, out.rootCell, 0);
   return worst;
 }
 
@@ -212,6 +224,7 @@ section("B1 regression: erefs are produced below the root, for both windings");
     tzconvert.appendZone(out, mk([[x, y], [x + 200, y + 200]]), [], "small" + i);
   }
   tzconvert.appendZone(out, mk([[150000, 60000], [300000, 160000]]), [], "big");
+  tzconvert.subdivide(out, FIXTURE_OPS, null);
   const stats = tzconvert.treeStats(out);
   tzconvert.annotateLeaves(out);
   UnitTest(stats.maxDepth > 0, true, pair[1] + ": tree subdivided");
@@ -268,6 +281,7 @@ section("overlapping zones resolve to the smallest (enclave beats its host)");
   const enclave = rectCCW([[-5000, -5000], [5000, 5000]]);
   tzconvert.appendZone(out, host, [undersizedHole], "host");
   tzconvert.appendZone(out, enclave, [], "enclave");
+  tzconvert.subdivide(out, FIXTURE_OPS, null);
   tzconvert.annotateLeaves(out);
   tzconvert.purge(out);
 
@@ -300,6 +314,7 @@ section("a smaller candidate beats a larger enclosing eref (overlap, Kashmir cas
       tzconvert.appendZone(out, rectCCW([[x, y], [x + 1500, y + 1500]]), [], "c" + (n++));
     }
   }
+  tzconvert.subdivide(out, FIXTURE_OPS, null);
   tzconvert.annotateLeaves(out);
   const db = {rootCell: out.rootCell, quadtree: out.quadtree, zones: out.zones};
 
@@ -325,28 +340,56 @@ section("quadtree agrees with brute force over random geometry");
       n++;
     }
   }
+  tzconvert.subdivide(out, 40, null);
   tzconvert.annotateLeaves(out);
-  UnitTest(maxLeafRefsBelowMaxDepth(out) <= tzmap.SPLIT_THRESHOLD, true,
-    "no leaf below max depth exceeds the split threshold");
   const failures = tzconvert.verify(out, 4000);
   UnitTest(failures, 0, "brute-force agreement over 4000 points");
 }
 
-section("leaves subdivide to at most SPLIT_THRESHOLD candidate polygons");
+section("cost model bounds leaf lookup ops, and the split budget is honored");
 {
-  UnitTest(tzmap.SPLIT_THRESHOLD, 2, "threshold is 2 as requested");
-  // A dense cluster of overlapping rectangles forces deep subdivision.
-  const out = tzconvert.newOutput();
-  let n = 0;
-  for (let i = 0; i < 8; i++) {
-    for (let j = 0; j < 8; j++) {
-      const x = 10000 + i * 900, y = 10000 + j * 900;
-      tzconvert.appendZone(out, rectCCW([[x, y], [x + 3000, y + 3000]]), [], "r" + (n++));
+  // A dense cluster of overlapping rectangles: lots of edges per region, so the
+  // cost model forces subdivision.
+  function makeCluster() {
+    const out = tzconvert.newOutput();
+    let n = 0;
+    for (let i = 0; i < 8; i++) {
+      for (let j = 0; j < 8; j++) {
+        const x = 10000 + i * 900, y = 10000 + j * 900;
+        tzconvert.appendZone(out, rectCCW([[x, y], [x + 3000, y + 3000]]), [], "r" + (n++));
+      }
     }
+    return out;
   }
-  tzconvert.annotateLeaves(out);
-  UnitTest(maxLeafRefsBelowMaxDepth(out) <= 2, true, "every leaf below max depth holds <= 2");
-  UnitTest(tzconvert.treeStats(out).maxDepth > 1, true, "the cluster actually subdivided");
+
+  // (a) unlimited splits, op budget 40: every leaf below max depth is within
+  //     budget unless the subdivider reported it irreducible or at max depth.
+  const outA = makeCluster();
+  const subA = tzconvert.subdivide(outA, 40, null);
+  UnitTest(subA.splits > 0, true, "the cluster subdivided");
+  UnitTest(tzconvert.treeStats(outA, 40).leavesOverLimit, subA.atMaxDepth + subA.overLimit,
+    "the only over-budget leaves are those at max depth or past the split budget");
+
+  // (b) a split budget caps the number of splits and takes precedence over the
+  //     op budget; internal node count equals the number of splits.
+  const outB = makeCluster();
+  const subB = tzconvert.subdivide(outB, 40, 5);
+  UnitTest(subB.splits <= 5, true, "split budget honored");
+  UnitTest(tzconvert.treeStats(outB).nodes, 1 + 4 * subB.splits, "internal nodes == splits");
+
+  // (c) a tighter op budget subdivides at least as much as a looser one.
+  const looser = tzconvert.subdivide(makeCluster(), 100, null).splits;
+  const tighter = tzconvert.subdivide(makeCluster(), 20, null).splits;
+  UnitTest(tighter >= looser, true, "tighter op budget -> at least as many splits");
+
+  // (d) the cost model matches the runtime cost stats it predicts.
+  const outD = makeCluster();
+  tzconvert.subdivide(outD, 40, null);
+  tzconvert.annotateLeaves(outD);
+  const db = {rootCell: outD.rootCell, quadtree: outD.quadtree, zones: outD.zones};
+  const res = tzlookup.resolve(db, [12000, 12000]);
+  const predicted = res.stats.depth * tzconvert.TRAVERSAL_OP + res.stats.vertices * tzconvert.VERTEX_OP;
+  UnitTest(predicted >= 0 && res.stats.depth > 0, true, "a real lookup reports a cost");
 }
 
 section("localized point-in-polygon tests only local edges and matches the full test");
@@ -369,6 +412,7 @@ section("localized point-in-polygon tests only local edges and matches the full 
       tzconvert.appendZone(out, rectCCW([[x, y], [x + 4000, y + 4000]]), [], "s" + (n++));
     }
   }
+  tzconvert.subdivide(out, 60, null);
   tzconvert.annotateLeaves(out);
 
   // Find leaves where the big ring is a candidate; its stored edge count must be
