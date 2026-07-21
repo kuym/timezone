@@ -219,11 +219,83 @@ function newOutput() {
   };
 }
 
-// Replace zone object references with numeric ids and drop empty members.
+// Compress a sorted list of edge indices into inclusive [first, last] runs.
+// Adjacent edges of a ring are usually contiguous where the ring enters and
+// leaves a cell, so a few runs capture what would otherwise be a long index
+// list.  Runs are kept linear (not wrapped across the n-1 -> 0 seam); a wrap
+// simply becomes two runs, which costs nothing at lookup time.
+function edgeRuns(indices) {
+  const runs = [];
+  for (let i = 0; i < indices.length; i++) {
+    if (runs.length > 0 && indices[i] == runs[runs.length - 1][1] + 1) {
+      runs[runs.length - 1][1] = indices[i];
+    } else {
+      runs.push([indices[i], indices[i]]);
+    }
+  }
+  return runs;
+}
+
+// Edge indices of `ring` that intersect `cell` (touch or cross it).  Edge i runs
+// from vertex i to vertex (i+1) mod n.
+function ringEdgesInCell(ring, cell) {
+  const idx = [];
+  const n = ring.length;
+  for (let i = 0; i < n; i++) {
+    if (geom.SegmentIntersectsAABB(cell, ring[i], ring[(i + 1) % n]) !== false) {
+      idx.push(i);
+    }
+  }
+  return edgeRuns(idx);
+}
+
+// Walk the tree and attach localization data to every leaf candidate so the
+// lookup can test only the ring edges that pass through the leaf cell.  For each
+// (leaf, candidate zone) it records the winding number of the cell center wrt
+// the full outer ring and the outer edge runs in the cell, plus the same for any
+// hole that crosses the cell (holes that miss the cell cannot affect points in
+// it).  Replaces each ref (a zone object) with {z, w, e, h?}.
+function annotateLeaves(output) {
+  let candidates = 0, storedRuns = 0, storedEdges = 0;
+
+  (function walk(node, cell) {
+    if (node.q && node.q.length > 0) {
+      node.q.forEach(function(q, i) { walk(q, splitCell(cell, i)); });
+      return;
+    }
+    const center = tzlookup.cellCenter(cell);
+    node.ref = node.ref.map(function(zone) {
+      const cand = {
+        z: zone.id,
+        w: geom.PolyWinding(zone.outer, center),
+        e: ringEdgesInCell(zone.outer, cell)
+      };
+      const holes = [];
+      for (let h = 0; h < zone.holes.length; h++) {
+        if (!aabbsOverlap(cell, zone.holeAABBs[h])) { continue; }
+        const runs = ringEdgesInCell(zone.holes[h], cell);
+        if (runs.length == 0) { continue; }             // hole does not cross this cell
+        holes.push({i: h, w: geom.PolyWinding(zone.holes[h], center), e: runs});
+      }
+      if (holes.length > 0) { cand.h = holes; }
+
+      candidates++;
+      cand.e.forEach(function(r) { storedRuns++; storedEdges += r[1] - r[0] + 1; });
+      return cand;
+    });
+  })(output.quadtree, output.rootCell);
+
+  return {candidates: candidates, runs: storedRuns, edges: storedEdges};
+}
+
+// Convert the annotated tree to its exported form: erefs become bare ids, ref
+// candidates keep their localization data (their `.z` is already an id), empty
+// members are dropped, and zone geometry is packed.  Requires annotateLeaves()
+// to have run first so that `node.ref` holds candidate objects rather than zone
+// objects.
 function purge(output) {
   (function walk(node) {
-    node.ref = node.ref.map(function(z) { return z.id; });
-    if (node.ref.length == 0) { delete node.ref; }
+    if (node.ref.length == 0) { delete node.ref; }      // candidates already {z, w, e, h?}
     node.eref = node.eref.map(function(z) { return z.id; });
     if (node.eref.length == 0) { delete node.eref; }
     node.q.forEach(walk);
@@ -240,6 +312,7 @@ function purge(output) {
     delete z.outer;
     delete z.holes;
     delete z.holeAABBs;
+    delete z._rings;
   });
   return output;
 }
@@ -274,6 +347,7 @@ module.exports = {
   classify: classify,
   appendZone: appendZone,
   newOutput: newOutput,
+  annotateLeaves: annotateLeaves,
   purge: purge,
   treeStats: treeStats,
 };
@@ -332,8 +406,14 @@ if (require.main == module) {
   console.error("exterior rings: " + ringsIn + ", holes: " + holesIn +
     ", skipped: " + skipped + ", antimeridian-wrapped: " + wrapped);
 
-  // Verify the built tree against brute force before writing it out.  This is
-  // the oracle that would have caught the winding-order bug immediately.
+  // Attach per-leaf edge subsets so lookups test only the ring edges that pass
+  // through each leaf cell.
+  const annot = annotateLeaves(output);
+  console.error("annotation: " + JSON.stringify(annot));
+
+  // Verify the built tree against brute force before writing it out.  This runs
+  // after annotation so it exercises the localized lookup, and is the oracle
+  // that would have caught the winding-order bug immediately.
   const samples = process.env.VERIFY? parseInt(process.env.VERIFY, 10) : 2000;
   if (samples > 0) {
     console.error("Verifying " + samples + " random points against brute force...");
@@ -362,7 +442,9 @@ function smallestZone(zones) {
 }
 
 // Compare quadtree resolution against an exhaustive scan of every zone.
-// Operates on the unpurged output, so zones still carry their decoded rings.
+// Must run AFTER annotateLeaves so it exercises the localized lookup path (the
+// per-leaf edge subsets), not just the tree descent.  Operates on the unpurged
+// output, so zones still carry their decoded rings.
 function verify(output, samples) {
   let failures = 0;
   // Deterministic LCG so a failing run can be reproduced.
@@ -390,16 +472,8 @@ function verify(output, samples) {
     });
     const expected = smallestZone(containing);
 
-    // Resolve directly against the in-memory rings (pre-purge, so no decode).
-    const hit = tzlookup.probe(output.quadtree, output.rootCell, point);
-    let actual = null;
-    if (hit.definite.length > 0) {
-      actual = smallestZone(hit.definite);
-    } else {
-      actual = smallestZone(hit.candidates.filter(function(z) {
-        return geom.RingsContainPoint(z.outer, z.holes, point);
-      }));
-    }
+    // The real localized resolution path.
+    const actual = tzlookup.resolve(db, point).zone;
 
     const ok = (expected === null)? (actual === null) :
       (actual !== null && actual.a == expected.a && actual.tzid == expected.tzid);

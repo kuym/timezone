@@ -60,17 +60,89 @@
     return {definite: definite, candidates: candidates, path: path, cell: cell};
   }
 
-  // Decode a zone's rings on first use and memoize them on the record.
+  // Decode a zone's rings on first use and memoize them on the record.  Handles
+  // both the exported artifact (origin + packed deltas in `o`/`p`/`h`) and the
+  // builder's in-memory pre-export zones (`outer`/`holes` already decoded).
   function zoneRings(zone) {
     if (!zone._rings) {
-      zone._rings = {
-        outer: polycodec.decodePolygon(zone.o, polycodec.base64ToBytes(zone.p)),
-        holes: (zone.h || []).map(function(h) {
-          return polycodec.decodePolygon(h.o, polycodec.base64ToBytes(h.p));
-        })
-      };
+      if (zone.outer) {
+        zone._rings = {outer: zone.outer, holes: zone.holes || []};
+      } else {
+        zone._rings = {
+          outer: polycodec.decodePolygon(zone.o, polycodec.base64ToBytes(zone.p)),
+          holes: (zone.h || []).map(function(h) {
+            return polycodec.decodePolygon(h.o, polycodec.base64ToBytes(h.p));
+          })
+        };
+      }
     }
     return zone._rings;
+  }
+
+  function isLeft(p0, p1, p2) {
+    return (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p2[0] - p0[0]) * (p1[1] - p0[1]);
+  }
+
+  // Signed number of times the directed segment C->q crosses the ring edges
+  // listed in `runs` (arrays of [firstEdge, lastEdge] inclusive index ranges).
+  // Returns null if any orientation is degenerate (a vertex lies on C->q, or an
+  // edge is collinear with it), signalling the caller to fall back to a full
+  // point-in-polygon test rather than risk an off-by-one.
+  function segmentCrossings(C, q, ring, runs) {
+    const n = ring.length;
+    let delta = 0;
+    for (let r = 0; r < runs.length; r++) {
+      for (let i = runs[r][0]; i <= runs[r][1]; i++) {
+        const A = ring[i], B = ring[(i + 1) % n];
+        const o1 = isLeft(A, B, C), o2 = isLeft(A, B, q);
+        if (o1 == 0 || o2 == 0) { return null; }
+        if ((o1 > 0) == (o2 > 0)) { continue; }         // C and q on the same side
+        const o3 = isLeft(C, q, A), o4 = isLeft(C, q, B);
+        if (o3 == 0 || o4 == 0) { return null; }
+        if ((o3 > 0) == (o4 > 0)) { continue; }         // A and B on the same side
+        delta += (o2 > 0)? 1 : -1;
+      }
+    }
+    return delta;
+  }
+
+  // Center of a cell.  Cell bounds are half-open powers of two, so this is exact
+  // (see the domain notes in tzmap.js) and matches the value used at build time.
+  function cellCenter(cell) {
+    return [(cell[0][0] + cell[1][0]) >> 1, (cell[0][1] + cell[1][1]) >> 1];
+  }
+
+  // Localized point-in-zone test.  Instead of walking every edge of the ring,
+  // it corrects the precomputed winding number of the cell center by the signed
+  // crossings of the segment center->point against only the edges that intersect
+  // this cell.  This is exact: the segment lies inside the convex cell, so no
+  // edge outside the cell can cross it, and wn(point) = wn(center) + crossings.
+  //
+  // `cand` carries, for the leaf's cell: `w` (winding of the cell center wrt the
+  // full outer ring) and `e` (outer edge-index runs intersecting the cell), plus
+  // `h` = [{i, w, e}] for each hole that crosses the cell (holes that do not
+  // cross cannot change the answer for any point in the cell, so they are
+  // omitted).  Falls back to the full test on any degeneracy.
+  function localContainsZone(zone, cell, cand, point) {
+    const rings = zoneRings(zone);
+    const C = cellCenter(cell);
+
+    const outerDelta = segmentCrossings(C, point, rings.outer, cand.e);
+    if (outerDelta === null) {
+      return geom.RingsContainPoint(rings.outer, rings.holes, point);
+    }
+    if (cand.w + outerDelta == 0) { return false; }     // outside the exterior ring
+
+    const holes = cand.h || [];
+    for (let k = 0; k < holes.length; k++) {
+      const hc = holes[k], holeRing = rings.holes[hc.i];
+      const holeDelta = segmentCrossings(C, point, holeRing, hc.e);
+      if (holeDelta === null) {
+        return geom.RingsContainPoint(rings.outer, rings.holes, point);
+      }
+      if (hc.w + holeDelta != 0) { return false; }      // inside a hole
+    }
+    return true;
   }
 
   function pointInZone(zone, point) {
@@ -103,26 +175,56 @@
     return best;
   }
 
-  // Full resolution: quadtree descent to narrow the candidate set, then an
-  // actual point-in-polygon test.  The quadtree alone is only a filter -- this
-  // second half is what the original demo was missing, which is why it reported
-  // three timezones for London.
+  // An `eref` entry is a bare zone id in the exported artifact, but a zone
+  // object in the builder's in-memory tree; a `ref` candidate is {z: id, ...}.
+  function zoneOf(db, entry) {
+    if (typeof entry == "number") { return db.zones[entry]; }
+    if (entry.z !== undefined) { return db.zones[entry.z]; }
+    return entry;
+  }
+
+  // Full resolution: quadtree descent to narrow the candidate set, then a
+  // localized point-in-polygon test.  The quadtree alone is only a filter --
+  // this second half is what the original demo was missing, which is why it
+  // reported three timezones for London.
+  //
+  // Zones in this dataset can overlap (disputed regions such as Kashmir, and the
+  // enclave-as-hole double representation), so `eref` -- a zone that provably
+  // covers the whole leaf cell -- is a guaranteed match but not necessarily the
+  // answer: a smaller candidate may also contain the point and, by the
+  // smallest-wins rule, should win.  Every zone that contains the point is
+  // either an eref on the descent path or a candidate at the leaf, so the
+  // correct answer is the smallest of (erefs + passing candidates).  When there
+  // are no candidates (the common case) this is still test-free.
   function resolve(db, point) {
     const hit = probe(db.quadtree, db.rootCell, point);
-
-    // `eref` means the zone provably encloses the whole leaf cell, so no
-    //   geometry test is needed.
-    if (hit.definite.length > 0) {
-      const zones = hit.definite.map(function(i) { return db.zones[i]; });
-      return {zone: smallest(zones), definite: true, probe: hit};
-    }
-
     const matches = [];
-    for (let i = 0; i < hit.candidates.length; i++) {
-      const zone = db.zones[hit.candidates[i]];
-      if (pointInZone(zone, point)) { matches.push(zone); }
+    let definiteCount = 0;
+
+    // erefs contain the point by construction; no geometry test needed.
+    for (let i = 0; i < hit.definite.length; i++) {
+      matches.push(zoneOf(db, hit.definite[i]));
     }
-    return {zone: smallest(matches), definite: false, probe: hit};
+    definiteCount = matches.length;
+
+    // Candidates carry per-leaf localization data (`.e`), so test only the ring
+    //   edges that actually pass through this leaf cell.  Fall back to the whole
+    //   ring if a candidate predates the annotation pass.
+    for (let i = 0; i < hit.candidates.length; i++) {
+      const cand = hit.candidates[i];
+      const zone = zoneOf(db, cand);
+      const inside = (cand && cand.e)?
+        localContainsZone(zone, hit.cell, cand, point) :
+        pointInZone(zone, point);
+      if (inside) { matches.push(zone); }
+    }
+
+    const winner = smallest(matches);
+    // `definite` reports whether the answer needed no polygon test at all: it
+    //   came from an eref and no candidate had to be evaluated.
+    const definite = winner !== null && definiteCount > 0 &&
+      hit.candidates.length == 0;
+    return {zone: winner, definite: definite, probe: hit};
   }
 
   return {
@@ -131,6 +233,9 @@
     probe: probe,
     zoneRings: zoneRings,
     pointInZone: pointInZone,
+    localContainsZone: localContainsZone,
+    cellCenter: cellCenter,
+    zoneOf: zoneOf,
     resolve: resolve
   };
 });

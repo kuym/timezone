@@ -29,8 +29,13 @@ const ROOT_CELL = [[X_MIN, Y_MIN], [X_MAX, Y_MAX]];
 // has a cell size of at least 2 units and midpoints remain exact.
 const MAX_DEPTH = 16;
 
-// Split threshold: a leaf holding this many refs subdivides on the next insert.
-const SPLIT_THRESHOLD = 5;
+// Split threshold: a leaf holding this many candidate polygons (refs)
+// subdivides when the next one is inserted, so a leaf below MAX_DEPTH holds at
+// most SPLIT_THRESHOLD candidates.  Lower means a deeper tree with fewer
+// polygons to test per lookup, at the cost of more nodes.  `eref` zones (those
+// that provably cover the whole cell) are resolved without any test and do not
+// count toward this limit.
+const SPLIT_THRESHOLD = 2;
 
 function clamp(v, lo, hi) {
   return (v < lo)? lo : ((v > hi)? hi : v);

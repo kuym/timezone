@@ -169,7 +169,21 @@ function buildFixture(mk) {
   FIXTURE.forEach(function(r, i) {
     tzconvert.appendZone(out, mk(r), [], "zone" + i);
   });
+  tzconvert.annotateLeaves(out);
   return out;
+}
+
+// Every leaf below MAX_DEPTH must hold at most SPLIT_THRESHOLD candidates.
+function maxLeafRefsBelowMaxDepth(out) {
+  let worst = 0;
+  (function walk(node, depth) {
+    if (node.q && node.q.length > 0) {
+      node.q.forEach(function(q, i) { walk(q, depth + 1); });
+    } else if (depth < tzmap.MAX_DEPTH) {
+      worst = Math.max(worst, node.ref.length);
+    }
+  })(out.quadtree, 0);
+  return worst;
 }
 
 section("B1 regression: the tree is identical for clockwise and counter-clockwise input");
@@ -199,6 +213,7 @@ section("B1 regression: erefs are produced below the root, for both windings");
   }
   tzconvert.appendZone(out, mk([[150000, 60000], [300000, 160000]]), [], "big");
   const stats = tzconvert.treeStats(out);
+  tzconvert.annotateLeaves(out);
   UnitTest(stats.maxDepth > 0, true, pair[1] + ": tree subdivided");
   UnitTest(stats.erefs > 0, true, pair[1] + ": large zone erefs below the root");
   UnitTest(tzconvert.verify(out, 2000), 0, pair[1] + ": agrees with brute force");
@@ -253,6 +268,7 @@ section("overlapping zones resolve to the smallest (enclave beats its host)");
   const enclave = rectCCW([[-5000, -5000], [5000, 5000]]);
   tzconvert.appendZone(out, host, [undersizedHole], "host");
   tzconvert.appendZone(out, enclave, [], "enclave");
+  tzconvert.annotateLeaves(out);
   tzconvert.purge(out);
 
   const db = {rootCell: out.rootCell, quadtree: out.quadtree, zones: out.zones};
@@ -262,6 +278,38 @@ section("overlapping zones resolve to the smallest (enclave beats its host)");
   UnitTest(geom.PolyContainsPoint(enclave, p), true, "enclave contains the point");
   UnitTest(tzlookup.resolve(db, p).zone.tzid, out.tz["enclave"].id,
     "the smaller zone wins");
+}
+
+section("a smaller candidate beats a larger enclosing eref (overlap, Kashmir case)");
+{
+  // The large zone becomes an `eref` for interior leaves; the smaller zone
+  // overlaps it and is a `ref` candidate.  A point inside both must resolve to
+  // the smaller one -- resolve() must not short-circuit on the eref.  This is
+  // the exact failure the real build surfaced in the disputed Kashmir region.
+  const out = tzconvert.newOutput();
+  const bigZone = rectCCW([[-200000, -120000], [200000, 120000]]);
+  const smallZone = rectCCW([[0, 0], [40000, 40000]]);       // smaller area, inside big
+  tzconvert.appendZone(out, bigZone, [], "big");
+  tzconvert.appendZone(out, smallZone, [], "small");
+  // Clutter near the small zone's right edge forces deep subdivision, so a leaf
+  //   there is fully inside `big` (eref) while `small` only crosses it (ref).
+  let n = 0;
+  for (let i = 0; i < 6; i++) {
+    for (let j = 0; j < 6; j++) {
+      const x = 36000 + i * 700, y = 10000 + j * 700;
+      tzconvert.appendZone(out, rectCCW([[x, y], [x + 1500, y + 1500]]), [], "c" + (n++));
+    }
+  }
+  tzconvert.annotateLeaves(out);
+  const db = {rootCell: out.rootCell, quadtree: out.quadtree, zones: out.zones};
+
+  // A point inside `small` (and inside `big`), near small's right edge.
+  const p = [39000, 20000];
+  UnitTest(geom.PolyContainsPoint(bigZone, p), true, "big contains the point");
+  UnitTest(geom.PolyContainsPoint(smallZone, p), true, "small contains the point");
+  const res = tzlookup.resolve(db, p);
+  UnitTest(res.zone.tzid, out.tz["small"].id, "the smaller overlapping zone wins over the eref");
+  UnitTest(tzconvert.verify(out, 3000), 0, "agrees with brute force");
 }
 
 section("quadtree agrees with brute force over random geometry");
@@ -277,8 +325,71 @@ section("quadtree agrees with brute force over random geometry");
       n++;
     }
   }
+  tzconvert.annotateLeaves(out);
+  UnitTest(maxLeafRefsBelowMaxDepth(out) <= tzmap.SPLIT_THRESHOLD, true,
+    "no leaf below max depth exceeds the split threshold");
   const failures = tzconvert.verify(out, 4000);
   UnitTest(failures, 0, "brute-force agreement over 4000 points");
+}
+
+section("leaves subdivide to at most SPLIT_THRESHOLD candidate polygons");
+{
+  UnitTest(tzmap.SPLIT_THRESHOLD, 2, "threshold is 2 as requested");
+  // A dense cluster of overlapping rectangles forces deep subdivision.
+  const out = tzconvert.newOutput();
+  let n = 0;
+  for (let i = 0; i < 8; i++) {
+    for (let j = 0; j < 8; j++) {
+      const x = 10000 + i * 900, y = 10000 + j * 900;
+      tzconvert.appendZone(out, rectCCW([[x, y], [x + 3000, y + 3000]]), [], "r" + (n++));
+    }
+  }
+  tzconvert.annotateLeaves(out);
+  UnitTest(maxLeafRefsBelowMaxDepth(out) <= 2, true, "every leaf below max depth holds <= 2");
+  UnitTest(tzconvert.treeStats(out).maxDepth > 1, true, "the cluster actually subdivided");
+}
+
+section("localized point-in-polygon tests only local edges and matches the full test");
+{
+  // One large many-vertex ring, plus a cluster of small polygons over part of it
+  // to force fine subdivision there.  In each leaf the big ring should contribute
+  // only the few edges that pass through that cell, not its whole boundary.
+  const out = tzconvert.newOutput();
+  const big = [];
+  const N = 240, R = 300000;
+  for (let i = 0; i < N; i++) {
+    const t = 2 * Math.PI * i / N;
+    big.push([Math.round(R * Math.cos(t)), Math.round(0.6 * R * Math.sin(t))]);
+  }
+  tzconvert.appendZone(out, big, [], "big");
+  let n = 0;
+  for (let i = 0; i < 5; i++) {
+    for (let j = 0; j < 5; j++) {
+      const x = 20000 + i * 1500, y = 20000 + j * 1500;
+      tzconvert.appendZone(out, rectCCW([[x, y], [x + 4000, y + 4000]]), [], "s" + (n++));
+    }
+  }
+  tzconvert.annotateLeaves(out);
+
+  // Find leaves where the big ring is a candidate; its stored edge count must be
+  // far below the full ring, and never exceed it.
+  let maxLocalEdges = 0, sawLocalized = false;
+  const bigId = out.tz["big"].id, bigZoneId = out.zones.find(function(z){return z.tzid==bigId;}).id;
+  (function walk(node) {
+    if (node.q && node.q.length > 0) { node.q.forEach(walk); return; }
+    node.ref.forEach(function(cand) {
+      if (cand.z !== bigZoneId) { return; }
+      let e = 0;
+      cand.e.forEach(function(r) { e += r[1] - r[0] + 1; });
+      UnitTest(e <= N, true, "local edge count never exceeds the full ring");
+      if (e > 0 && e < N / 4) { sawLocalized = true; }
+      maxLocalEdges = Math.max(maxLocalEdges, e);
+    });
+  })(out.quadtree);
+  UnitTest(sawLocalized, true, "at least one leaf tests a small subset of the ring");
+
+  // The localized test must agree with the full winding-number test everywhere.
+  UnitTest(tzconvert.verify(out, 4000), 0, "localized lookup agrees with brute force");
 }
 
 section("purge() produces a decodable artifact");

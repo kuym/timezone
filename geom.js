@@ -249,6 +249,26 @@ function PolyContainsPoints(poly, points) {
   return wn.map(function(n) {return n != 0;});
 }
 
+// Signed winding number of `point` with respect to closed ring `poly`.
+// Positive for a CCW ring enclosing the point, negative for CW; 0 when outside.
+// PolyContainsPoint is exactly (PolyWinding != 0); this exposes the integer so
+// the localized lookup can add an incremental correction to it.
+function PolyWinding(poly, point) {
+  function isLeft(p0, p1, p2) {
+    return (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p2[0] - p0[0]) * (p1[1] - p0[1]);
+  }
+  let wn = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const cur = poly[i], next = (i == (poly.length - 1))? poly[0] : poly[i + 1];
+    if (cur[1] <= point[1]) {
+      if (next[1] > point[1] && isLeft(cur, next, point) > 0) { wn++; }
+    } else {
+      if (next[1] <= point[1] && isLeft(cur, next, point) < 0) { wn--; }
+    }
+  }
+  return wn;
+}
+
 // Convenience single-point form of PolyContainsPoints()
 function PolyContainsPoint(poly, point) {
   return PolyContainsPoints(poly, [point])[0];
@@ -288,6 +308,7 @@ return {
   PolyAABB: PolyAABB,
   PolyContainsPoints: PolyContainsPoints,
   PolyContainsPoint: PolyContainsPoint,
+  PolyWinding: PolyWinding,
   RingsContainPoint: RingsContainPoint,
   SegmentIntersectsAABB: SegmentIntersectsAABB,
   AABBIntersectsPoly: AABBIntersectsPoly,
@@ -302,7 +323,8 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
   const g = module.exports;
   const VClosestSegment = g.VClosestSegment, VDistToLine = g.VDistToLine,
         VSegmentsIntersect = g.VSegmentsIntersect, PolyContainsPoints = g.PolyContainsPoints,
-        PolyContainsPoint = g.PolyContainsPoint, RingsContainPoint = g.RingsContainPoint,
+        PolyContainsPoint = g.PolyContainsPoint, PolyWinding = g.PolyWinding,
+        RingsContainPoint = g.RingsContainPoint,
         SegmentIntersectsAABB = g.SegmentIntersectsAABB, AABBIntersectsPoly = g.AABBIntersectsPoly,
         AABB_DISJOINT = g.AABB_DISJOINT, AABB_CROSSES = g.AABB_CROSSES,
         AABB_CONTAINS = g.AABB_CONTAINS;
@@ -372,6 +394,16 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
 
   // B9: VDistToLine must not return NaN for a degenerate line
   UnitTest(VDistToLine([1, 1], [1, 1], [4, 5]), 5);
+
+  // PolyWinding: +1 inside a CCW ring, -1 inside a CW ring, 0 outside; and
+  //   (PolyWinding != 0) must agree with PolyContainsPoint everywhere.
+  const wsq = [[0, 0], [10, 0], [10, 10], [0, 10]];
+  UnitTest(PolyWinding(wsq, [5, 5]), 1);
+  UnitTest(PolyWinding(wsq.slice().reverse(), [5, 5]), -1);
+  UnitTest(PolyWinding(wsq, [15, 5]), 0);
+  [[5, 5], [1, 9], [15, 5], [-3, 2], [9, 1]].forEach(function(p) {
+    UnitTest(PolyWinding(wsq, p) != 0, PolyContainsPoint(wsq, p), "winding vs contains " + p);
+  });
 
   console.log("geom.js: all tests passed");
 }

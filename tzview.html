@@ -157,13 +157,18 @@
 			}
 
 			// Show what the quadtree narrowed the search to, and how the answer
-			// was reached: `eref` needs no geometry test, `ref` candidates each
-			// require a point-in-polygon test.
-			const cand = res.probe.candidates.map(function(i) {
-				return db.tzById[db.zones[i].tzid].n;
+			// was reached: `eref` needs no geometry test; each `ref` candidate is
+			// tested against only the ring edges that cross this leaf cell.
+			const cand = res.probe.candidates.map(function(c) {
+				const z = db.zones[c.z];
+				let edges = 0;
+				(c.e || []).forEach(function(r) { edges += r[1] - r[0] + 1; });
+				(c.h || []).forEach(function(h) {
+					(h.e || []).forEach(function(r) { edges += r[1] - r[0] + 1; });
+				});
+				const full = tzlookup.zoneRings(z).outer.length;
+				return db.tzById[z.tzid].n + " (" + edges + "/" + full + " edges)";
 			});
-			const seen = [];
-			cand.forEach(function(n) { if (seen.indexOf(n) == -1) { seen.push(n); } });
 
 			document.getElementById("readout").innerHTML =
 				'<span class="tz ' + cls + '">' + label + '</span>' +
@@ -177,7 +182,7 @@
 				'   cell [' + res.probe.cell[0] + '] .. [' + res.probe.cell[1] + ']\n' +
 				'definitive (eref): ' + res.probe.definite.length +
 				'   candidates (ref): ' + res.probe.candidates.length +
-				(seen.length ? '  -> ' + seen.join(", ") : '');
+				(cand.length ? '  -> ' + cand.join(", ") : '');
 
 			const newHighlight = res.zone || null;
 			if (newHighlight !== highlight) { highlight = newHighlight; redraw(); }
