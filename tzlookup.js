@@ -88,11 +88,15 @@
   // Returns null if any orientation is degenerate (a vertex lies on C->q, or an
   // edge is collinear with it), signalling the caller to fall back to a full
   // point-in-polygon test rather than risk an off-by-one.
-  function segmentCrossings(C, q, ring, runs) {
+  //
+  // `stats`, if given, accumulates `vertices` -- one per ring edge examined --
+  // so a caller can report how much point-in-polygon work a lookup actually did.
+  function segmentCrossings(C, q, ring, runs, stats) {
     const n = ring.length;
     let delta = 0;
     for (let r = 0; r < runs.length; r++) {
       for (let i = runs[r][0]; i <= runs[r][1]; i++) {
+        if (stats) { stats.vertices++; }
         const A = ring[i], B = ring[(i + 1) % n];
         const o1 = isLeft(A, B, C), o2 = isLeft(A, B, q);
         if (o1 == 0 || o2 == 0) { return null; }
@@ -104,6 +108,14 @@
       }
     }
     return delta;
+  }
+
+  // Vertices a full-ring test would visit: one per edge of the outer ring and of
+  // every hole.
+  function fullRingVertices(rings) {
+    let n = rings.outer.length;
+    for (let i = 0; i < rings.holes.length; i++) { n += rings.holes[i].length; }
+    return n;
   }
 
   // Center of a cell.  Cell bounds are half-open powers of two, so this is exact
@@ -123,12 +135,13 @@
   // `h` = [{i, w, e}] for each hole that crosses the cell (holes that do not
   // cross cannot change the answer for any point in the cell, so they are
   // omitted).  Falls back to the full test on any degeneracy.
-  function localContainsZone(zone, cell, cand, point) {
+  function localContainsZone(zone, cell, cand, point, stats) {
     const rings = zoneRings(zone);
     const C = cellCenter(cell);
 
-    const outerDelta = segmentCrossings(C, point, rings.outer, cand.e);
+    const outerDelta = segmentCrossings(C, point, rings.outer, cand.e, stats);
     if (outerDelta === null) {
+      if (stats) { stats.fallbacks++; stats.vertices += fullRingVertices(rings); }
       return geom.RingsContainPoint(rings.outer, rings.holes, point);
     }
     if (cand.w + outerDelta == 0) { return false; }     // outside the exterior ring
@@ -136,8 +149,9 @@
     const holes = cand.h || [];
     for (let k = 0; k < holes.length; k++) {
       const hc = holes[k], holeRing = rings.holes[hc.i];
-      const holeDelta = segmentCrossings(C, point, holeRing, hc.e);
+      const holeDelta = segmentCrossings(C, point, holeRing, hc.e, stats);
       if (holeDelta === null) {
+        if (stats) { stats.fallbacks++; stats.vertices += fullRingVertices(rings); }
         return geom.RingsContainPoint(rings.outer, rings.holes, point);
       }
       if (hc.w + holeDelta != 0) { return false; }      // inside a hole
@@ -145,7 +159,7 @@
     return true;
   }
 
-  function pointInZone(zone, point) {
+  function pointInZone(zone, point, stats) {
     // Cheap reject before decoding anything.
     if (zone.aabb) {
       if (point[0] < zone.aabb[0][0] || point[0] > zone.aabb[1][0] ||
@@ -154,6 +168,7 @@
       }
     }
     const rings = zoneRings(zone);
+    if (stats) { stats.vertices += fullRingVertices(rings); }
     return geom.RingsContainPoint(rings.outer, rings.holes, point);
   }
 
@@ -199,13 +214,21 @@
   function resolve(db, point) {
     const hit = probe(db.quadtree, db.rootCell, point);
     const matches = [];
-    let definiteCount = 0;
+
+    // Cost accounting, so a caller can gauge the work a lookup took:
+    //   depth      - quadtree levels descended (2 coordinate comparisons each)
+    //   candidates - zones point-in-polygon-tested at the leaf
+    //   vertices   - ring edges actually evaluated across those tests (the
+    //                localized subsets, or a full ring on a degeneracy fallback)
+    //   fallbacks  - tests that fell back to the full ring
+    const stats = {depth: hit.path.length, candidates: hit.candidates.length,
+                   vertices: 0, fallbacks: 0};
 
     // erefs contain the point by construction; no geometry test needed.
     for (let i = 0; i < hit.definite.length; i++) {
       matches.push(zoneOf(db, hit.definite[i]));
     }
-    definiteCount = matches.length;
+    const definiteCount = matches.length;
 
     // Candidates carry per-leaf localization data (`.e`), so test only the ring
     //   edges that actually pass through this leaf cell.  Fall back to the whole
@@ -214,8 +237,8 @@
       const cand = hit.candidates[i];
       const zone = zoneOf(db, cand);
       const inside = (cand && cand.e)?
-        localContainsZone(zone, hit.cell, cand, point) :
-        pointInZone(zone, point);
+        localContainsZone(zone, hit.cell, cand, point, stats) :
+        pointInZone(zone, point, stats);
       if (inside) { matches.push(zone); }
     }
 
@@ -224,7 +247,7 @@
     //   came from an eref and no candidate had to be evaluated.
     const definite = winner !== null && definiteCount > 0 &&
       hit.candidates.length == 0;
-    return {zone: winner, definite: definite, probe: hit};
+    return {zone: winner, definite: definite, probe: hit, stats: stats};
   }
 
   return {

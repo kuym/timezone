@@ -158,17 +158,28 @@
 
 			// Show what the quadtree narrowed the search to, and how the answer
 			// was reached: `eref` needs no geometry test; each `ref` candidate is
-			// tested against only the ring edges that cross this leaf cell.
+			// tested against only the ring edges that cross this leaf cell.  Each
+			// name is annotated with (evaluated / full) ring vertices, showing how
+			// much the per-leaf localization saved for that candidate.
 			const cand = res.probe.candidates.map(function(c) {
 				const z = db.zones[c.z];
-				let edges = 0;
-				(c.e || []).forEach(function(r) { edges += r[1] - r[0] + 1; });
+				let evald = 0;
+				(c.e || []).forEach(function(r) { evald += r[1] - r[0] + 1; });
 				(c.h || []).forEach(function(h) {
-					(h.e || []).forEach(function(r) { edges += r[1] - r[0] + 1; });
+					(h.e || []).forEach(function(r) { evald += r[1] - r[0] + 1; });
 				});
-				const full = tzlookup.zoneRings(z).outer.length;
-				return db.tzById[z.tzid].n + " (" + edges + "/" + full + " edges)";
+				const rings = tzlookup.zoneRings(z);
+				let full = rings.outer.length;
+				rings.holes.forEach(function(h) { full += h.length; });
+				return db.tzById[z.tzid].n + " (" + evald + "/" + full + " verts)";
 			});
+
+			// Cost to resolve this point: the quadtree descent is `depth` levels,
+			// each a pair of coordinate comparisons; the leaf work is the number of
+			// polygon vertices actually evaluated in the point-in-polygon tests.
+			const s = res.stats;
+			const descentComparisons = s.depth * 2;
+			const total = descentComparisons + s.vertices;
 
 			document.getElementById("readout").innerHTML =
 				'<span class="tz ' + cls + '">' + label + '</span>' +
@@ -182,7 +193,11 @@
 				'   cell [' + res.probe.cell[0] + '] .. [' + res.probe.cell[1] + ']\n' +
 				'definitive (eref): ' + res.probe.definite.length +
 				'   candidates (ref): ' + res.probe.candidates.length +
-				(cand.length ? '  -> ' + cand.join(", ") : '');
+				(cand.length ? '  -> ' + cand.join(", ") : '') + '\n' +
+				'<b>cost</b>: descent ' + s.depth + ' levels (' + descentComparisons +
+				' comparisons) + leaf ' + s.vertices + ' vertices evaluated' +
+				(s.fallbacks ? ' (' + s.fallbacks + ' full-ring fallback)' : '') +
+				'  =  ' + total + ' ops';
 
 			const newHighlight = res.zone || null;
 			if (newHighlight !== highlight) { highlight = newHighlight; redraw(); }
