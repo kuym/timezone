@@ -56,7 +56,47 @@ struct Options {
     max_ops: i64,
     max_splits: Option<usize>,
     verify: usize,
+    leaf_km: f64,
 }
+
+const HELP: &str = "\
+tzconvert — timezone quadtree compressor (Rust port of tzconvert.js)
+
+USAGE:
+    tzconvert [OPTIONS] [OUTPUT]
+
+    OUTPUT   Output file path (positional).            [default: quadtree.json]
+
+OPTIONS:
+    --input=PATH       Input GeoJSON FeatureCollection. [default: data/combined.json]
+    --format=FMT       Output format: json | binary | quad.          [default: json]
+    --epsilon=N        RDP simplification tolerance, in quantized units (~38 m
+                       each).                                            [default: 8]
+    --max-ops=N        Per-leaf lookup cost budget (json/binary): a leaf over this
+                       many ops is split.                              [default: 500]
+    --max-splits=N     Hard cap on the number of leaf splits; TAKES PRECEDENCE over
+                       --max-ops, trading artifact size for lookup speed.
+                                                                 [default: unlimited]
+    --leaf-km=N        (quad format) stop splitting a cell once its longest edge is
+                       under N km; the majority-area tzid wins.        [default: 10]
+    --verify=N         Cross-check N random points against brute force (0 disables).
+                                                                     [default: 3000]
+    -h, --help         Print this help and exit.
+
+FORMATS:
+    json     Full quadtree + packed polygons; the quadtree.json schema (see
+             quadtree.md). Byte-for-byte identical to the JavaScript build.
+    binary   Compact binary of the full artifact. STUB — header only, not yet
+             implemented.
+    quad     Experimental. A tiny quadtree with NO polygons: every leaf resolves
+             to one tzid (majority area at the --leaf-km limit). See rust/README.md.
+
+EXAMPLES:
+    tzconvert --input=data/combined.json quadtree.json
+    tzconvert --max-ops=250 --max-splits=2000 quadtree.json
+    tzconvert --format=quad --leaf-km=10 tz.quad
+
+Run from the project root so the default --input path resolves.";
 
 fn parse_args() -> Result<Options, String> {
     let mut opt = Options {
@@ -67,9 +107,13 @@ fn parse_args() -> Result<Options, String> {
         max_ops: 500,
         max_splits: None,
         verify: 3000,
+        leaf_km: 10.0,
     };
     for arg in std::env::args().skip(1) {
-        if let Some(v) = arg.strip_prefix("--input=") {
+        if arg == "--help" || arg == "-h" {
+            println!("{HELP}");
+            std::process::exit(0);
+        } else if let Some(v) = arg.strip_prefix("--input=") {
             opt.input = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--format=") {
             opt.format = v.to_string();
@@ -81,6 +125,8 @@ fn parse_args() -> Result<Options, String> {
             opt.max_splits = Some(v.parse().map_err(|_| format!("bad --max-splits: {v}"))?);
         } else if let Some(v) = arg.strip_prefix("--verify=") {
             opt.verify = v.parse().map_err(|_| format!("bad --verify: {v}"))?;
+        } else if let Some(v) = arg.strip_prefix("--leaf-km=") {
+            opt.leaf_km = v.parse().map_err(|_| format!("bad --leaf-km: {v}"))?;
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {arg}"));
         } else {
@@ -112,7 +158,7 @@ fn run() -> Result<(), String> {
         opt.output
     );
 
-    let serializer = serialize::for_format(&opt.format)?;
+    let serializer = serialize::for_format(&opt.format, opt.leaf_km * 1000.0)?;
 
     eprintln!("loading {} ...", opt.input);
     let file = File::open(&opt.input).map_err(|e| format!("opening {}: {e}", opt.input))?;
@@ -170,39 +216,43 @@ fn run() -> Result<(), String> {
         "exterior rings: {rings_in}, holes: {holes_in}, skipped: {skipped}, antimeridian-wrapped: {wrapped}"
     );
 
-    // Build the tree with the cost model.
-    eprintln!(
-        "subdividing (max-ops={}, max-splits={}) ...",
-        opt.max_ops,
-        opt.max_splits.map(|n| n.to_string()).unwrap_or_else(|| "unlimited".into())
-    );
-    let sub = out.subdivide(opt.max_ops, opt.max_splits);
-    eprintln!(
-        "subdivision: {{\"splits\":{},\"atMaxDepth\":{},\"overLimit\":{}}}",
-        sub.splits, sub.at_max_depth, sub.over_limit
-    );
+    // The cost-model quadtree + packed geometry are only needed by formats that
+    // serialize them (json, binary).  Formats that build their own tree (quad)
+    // skip this whole phase.
+    if serializer.uses_cost_tree() {
+        eprintln!(
+            "subdividing (max-ops={}, max-splits={}) ...",
+            opt.max_ops,
+            opt.max_splits.map(|n| n.to_string()).unwrap_or_else(|| "unlimited".into())
+        );
+        let sub = out.subdivide(opt.max_ops, opt.max_splits);
+        eprintln!(
+            "subdivision: {{\"splits\":{},\"atMaxDepth\":{},\"overLimit\":{}}}",
+            sub.splits, sub.at_max_depth, sub.over_limit
+        );
 
-    // Cost stats before annotate (which consumes the candidate zone lists).
-    let st = out.tree_stats(Some(opt.max_ops));
-    eprintln!(
-        "quadtree: {{\"nodes\":{},\"leaves\":{},\"refs\":{},\"erefs\":{},\"maxDepth\":{},\
-         \"maxLeafRefs\":{},\"maxLeafCost\":{},\"leavesOverLimit\":{}}}",
-        st.nodes, st.leaves, st.refs, st.erefs, st.max_depth, st.max_leaf_refs, st.max_leaf_cost,
-        st.leaves_over_limit.unwrap_or(0)
-    );
+        // Cost stats before annotate (which consumes the candidate zone lists).
+        let st = out.tree_stats(Some(opt.max_ops));
+        eprintln!(
+            "quadtree: {{\"nodes\":{},\"leaves\":{},\"refs\":{},\"erefs\":{},\"maxDepth\":{},\
+             \"maxLeafRefs\":{},\"maxLeafCost\":{},\"leavesOverLimit\":{}}}",
+            st.nodes, st.leaves, st.refs, st.erefs, st.max_depth, st.max_leaf_refs, st.max_leaf_cost,
+            st.leaves_over_limit.unwrap_or(0)
+        );
 
-    out.annotate();
+        out.annotate();
 
-    if opt.verify > 0 {
-        eprintln!("verifying {} random points against brute force ...", opt.verify);
-        let failures = out.verify(opt.verify);
-        if failures > 0 {
-            return Err(format!("{failures}/{} lookups disagreed with brute force", opt.verify));
+        if opt.verify > 0 {
+            eprintln!("verifying {} random points against brute force ...", opt.verify);
+            let failures = out.verify(opt.verify);
+            if failures > 0 {
+                return Err(format!("{failures}/{} lookups disagreed with brute force", opt.verify));
+            }
+            eprintln!("  all {} lookups agree", opt.verify);
         }
-        eprintln!("  all {} lookups agree", opt.verify);
-    }
 
-    out.pack();
+        out.pack();
+    }
 
     if !serializer.is_complete() {
         eprintln!(

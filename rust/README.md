@@ -63,6 +63,64 @@ driver is format-agnostic and a new format is one `impl`:
   file as a real artifact. The scaffolding (trait wiring, CLI dispatch, LE
   `Writer` helpers, header layout) is in place for the eventual implementation.
 
+- **`quad`** (experimental, Rust-only) — a very compact quadtree with **no
+  polygons**. It builds its own rough tree from the zone geometry: split until a
+  cell is homogeneous (one tzid) or its longest edge (in metres, at the cell's
+  latitude) drops below `--leaf-km` (default 10 km); at that limit the tzid with
+  the most area in the cell wins (8×8 area sampling via the localized winding
+  test). Every leaf resolves to exactly one tzid, so lookups are pure integer
+  cell descent with no geometry.
+
+  ```
+  ./rust/target/release/tzconvert --input=data/combined.json --format=quad --leaf-km=10 tz.quad
+  ```
+
+  Size vs accuracy (agreement with exact smallest-area lookup; misses are within
+  ~`leaf-km` of a border):
+
+  | --leaf-km | size | accuracy |
+  |---|---|---|
+  | 50 | 151 KB | 98.7% |
+  | 20 | 356 KB | 99.5% |
+  | **10** | **767 KB** | **99.7%** |
+  | 5 | 1.6 MB | 99.95% |
+
+  **File layout** (see `serialize/quad.rs`):
+
+  ```
+  magic "TZQ2"                          4 bytes
+  section 1 — quadtree: one recursive node
+      node := len:q
+              len == 0  -> leaf:     tzid:q
+              len  > 0  -> internal: len bytes = 4 child nodes (quadrants 0..3)
+  section 2 — tzid table:
+      count:q, then count × ( nameLen:q, UTF-8 name )   — indexed by tzid
+  ```
+
+  `q` is a 3-form integer code selected by the top bits of the first byte:
+
+  ```
+    A  0aaaaaaa                     q = a           →   0 ..   127   (1 byte)
+    B  10aaaaaa aaaaaaaa            q = a + 128      → 128 .. 16511   (2 bytes)
+    C  11aaaaaa aaaaaaaa aaaaaaaa   q = 2a + 16514   → even, 16514.. (3 bytes)
+  ```
+
+  (equivalently the "value" `(q+1)*2` is `(a+1)*2` / `a*2+258` / `a*4+33030`).
+  `q` is exact below 16512, so tzids, name lengths, and most node lengths pad
+  nothing; only node payloads ≥ 16512 bytes round up to the next even value.
+  Node lengths reach form C; tzids only ever use A or B. Max encodable `q` is
+  8_404_120, capping the tree at ~8 MB (use a larger `--leaf-km` if exceeded).
+
+  **tzid sorting**: before encoding, tzids are renumbered by descending
+  reference count, so the most-used timezones (and open ocean, usually the
+  single commonest value) get the lowest ids and encode in form A (1 byte). This
+  is worth ~17% over an unsorted UTF-8-style varint. A table entry with an empty
+  name means "no timezone" (ocean).
+
+  The internal node length prefix lets a reader skip whole subtrees, so lookup is
+  O(depth) directly on the bytes. The reference reader is `../tzlookup_quad.js`
+  (Node + browser), which also traces the byte offsets each lookup seeks to.
+
 ## Parity with the JS compressor
 
 Two details make the output bit-identical rather than merely equivalent:
