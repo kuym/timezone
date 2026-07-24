@@ -2,7 +2,7 @@
 //!
 //! Reads a GeoJSON FeatureCollection of timezone polygons, quantizes and
 //! simplifies them, builds a cost-model-driven quadtree, verifies it against
-//! brute force, and serializes it (JSON today; binary is a stub).
+//! brute force, and serializes it (json, binary, or quad).
 
 mod build;
 mod geom;
@@ -86,8 +86,8 @@ OPTIONS:
 FORMATS:
     json     Full quadtree + packed polygons; the quadtree.json schema (see
              quadtree.md). Byte-for-byte identical to the JavaScript build.
-    binary   Compact binary of the full artifact. STUB — header only, not yet
-             implemented.
+    binary   Compact binary of the full artifact (quadtree + packed polygons,
+             no base64); ~42% smaller than json. See rust/README.md.
     quad     Experimental. A tiny quadtree with NO polygons: every leaf resolves
              to one tzid (majority area at the --leaf-km limit). See rust/README.md.
 
@@ -256,8 +256,8 @@ fn run() -> Result<(), String> {
 
     if !serializer.is_complete() {
         eprintln!(
-            "WARNING: the '{}' serializer is a STUB — it writes only a self-describing header; \
-             node/zone/geometry sections are not yet implemented. The file is NOT a usable artifact.",
+            "WARNING: the '{}' serializer is INCOMPLETE — some sections (polygon geometry) are \
+             not yet implemented, so the file is not a usable standalone artifact.",
             serializer.format_name()
         );
     }

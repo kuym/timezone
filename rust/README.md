@@ -56,12 +56,35 @@ driver is format-agnostic and a new format is one `impl`:
 
 - **`json`** — complete; produces the exact `quadtree.json` schema (see
   `../quadtree.md`), compact and with the same key ordering as the JS writer.
-- **`binary`** — a **stub**. It writes only a self-describing header (magic
-  `TZQT`, version, quant block, counts); the node/zone/geometry sections are
-  `TODO`, pending the format design in `../ANALYSIS.md` §6. `is_complete()`
-  returns false, so the driver prints a loud warning and never presents the stub
-  file as a real artifact. The scaffolding (trait wiring, CLI dispatch, LE
-  `Writer` helpers, header layout) is in place for the eventual implementation.
+- **`binary`** — full-artifact compact format, **complete** (`is_complete()` is
+  true). ~42% smaller than `json` (1.08 MB vs 1.87 MB) — no base64, plus the
+  quadtree optimizations. Four sections after a fixed header (magic `TZQT`,
+  version, quant block, counts):
+
+  1. **quadtree** — reuses the `quad` format's primitives (the `q` varint in
+     `serialize/qvarint.rs`, plus recursive length-prefixed skippable nodes) but
+     encodes the real cost-model tree: each node's `eref` list and, at leaves, the
+     `ref` candidates with their localized point-in-polygon data (winding, edge
+     runs, holes). Four encodings squeeze it 30% (104,637 → 73,077 bytes):
+     - **P1** packs each candidate's winding, run count and hole presence into one
+       `q` (winding is only ever −1/0/+1, holes almost always absent);
+     - **P2** folds a node's internal/eref flags and leaf ref-count into one `q`;
+     - **P4/P5** renumber zones by descending reference count (**rank**) so the
+       busiest get 1-byte ids, and delta-code the sorted candidate ranks in a leaf.
+     - *(Not done, to keep the decoder fast/low-memory: dropping the per-leaf
+       length prefix — parse-to-skip; and omitting the localized data to recompute
+       it at load — O(ring) per candidate.)*
+  2. **zones** — one record per zone in rank order: `tzid`, area, aabb, then each
+     ring as an origin + the **same packed delta stream as `json` (`polycodec`),
+     but stored raw (no base64) behind a length prefix**.
+  3. **tz names** — length-prefixed UTF-8, indexed by tzid.
+
+  Two integer encodings appear: the `q` varint (small/paddable values — tree
+  structure) and, in the zones section, an **exact** varint (`q` byte-count + that
+  many LE bytes) for polygon lengths, coordinates and areas — these are large and
+  of arbitrary parity, which the `q` 3-byte form (even-only ≥16512) cannot
+  represent. Every section is validated by a decode round-trip against the source.
+  The full layout is documented at the top of `serialize/binary.rs`.
 
 - **`quad`** (experimental, Rust-only) — a very compact quadtree with **no
   polygons**. It builds its own rough tree from the zone geometry: split until a
@@ -80,19 +103,20 @@ driver is format-agnostic and a new format is one `impl`:
 
   | --leaf-km | size | accuracy |
   |---|---|---|
-  | 50 | 151 KB | 98.7% |
-  | 20 | 356 KB | 99.5% |
-  | **10** | **767 KB** | **99.7%** |
-  | 5 | 1.6 MB | 99.95% |
+  | 50 | 133 KB | 98.7% |
+  | 20 | 316 KB | 99.5% |
+  | **10** | **685 KB** | **99.7%** |
+  | 5 | 1.4 MB | 99.95% |
 
   **File layout** (see `serialize/quad.rs`):
 
   ```
-  magic "TZQ2"                          4 bytes
+  magic "TZQ3"                          4 bytes
   section 1 — quadtree: one recursive node
       node := len:q
-              len == 0  -> leaf:     tzid:q
-              len  > 0  -> internal: len bytes = 4 child nodes (quadrants 0..3)
+              len == 0  -> ocean leaf: no timezone, nothing follows (1 byte)
+              len == 1  -> leaf:       tzid:q follows
+              len >= 2  -> internal:   len bytes = 4 child nodes (quadrants 0..3)
   section 2 — tzid table:
       count:q, then count × ( nameLen:q, UTF-8 name )   — indexed by tzid
   ```
@@ -111,11 +135,11 @@ driver is format-agnostic and a new format is one `impl`:
   Node lengths reach form C; tzids only ever use A or B. Max encodable `q` is
   8_404_120, capping the tree at ~8 MB (use a larger `--leaf-km` if exceeded).
 
-  **tzid sorting**: before encoding, tzids are renumbered by descending
-  reference count, so the most-used timezones (and open ocean, usually the
-  single commonest value) get the lowest ids and encode in form A (1 byte). This
-  is worth ~17% over an unsorted UTF-8-style varint. A table entry with an empty
-  name means "no timezone" (ocean).
+  **ocean & tzid sorting**: open ocean is the single most common leaf, so it gets
+  a dedicated 1-byte encoding (`len == 0`, no tzid, no table slot). The remaining
+  real tzids are renumbered by descending reference count, so the most-used
+  timezone gets id 0 and encodes in form A (1 byte). A leaf of length 0 is ocean;
+  a leaf of length 1 carries its tzid.
 
   The internal node length prefix lets a reader skip whole subtrees, so lookup is
   O(depth) directly on the bytes. The reference reader is `../tzlookup_quad.js`

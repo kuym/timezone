@@ -28,34 +28,34 @@
 //! ## File layout
 //!
 //! ```text
-//!   magic   "TZQ2"                              4 bytes
+//!   magic   "TZQ3"                              4 bytes
 //!   section 1 — quadtree: one recursive node
 //!       node := len:q
-//!               len == 0 -> leaf:     tzid:q
-//!               len  > 0 -> internal: `len` bytes = the 4 child nodes (quadrants 0..3)
+//!               len == 0 -> ocean leaf: no timezone; NOTHING follows (1 byte total)
+//!               len == 1 -> leaf:       tzid:q follows
+//!               len >= 2 -> internal:   `len` bytes = the 4 child nodes (quadrants 0..3)
 //!   section 2 — tzid table:
 //!       count:q, then count × ( nameLen:q, name:UTF-8 bytes )   — indexed by tzid
 //! ```
 //!
-//! tzids are **sorted by descending reference count** before encoding, so the
-//! most-used timezones get the lowest ids (form A, 1 byte).  A table entry with
-//! an empty name is "no timezone" (open ocean).
+//! Open ocean is the single most common leaf value, so it gets a dedicated
+//! 1-byte encoding (`len == 0`, no tzid) instead of a table slot.  The remaining
+//! (real) tzids are **sorted by descending reference count** before encoding, so
+//! the most-used timezone gets id 0 (form A, 1 byte).
 
 use std::collections::HashMap;
 
+use super::qvarint::{read_q, representable, write_q, Q_MAX};
 use super::Serializer;
 use crate::build::{classify, Output, Rel, Zone};
 use crate::geom::{self, Aabb, Pt};
 use crate::lookup::{cell_center, quadrant_for_point, segment_crossings, split_cell};
 use crate::quant::{ROOT_CELL, X_SCALE, Y_SCALE};
 
-const MAGIC: &[u8; 4] = b"TZQ2";
+const MAGIC: &[u8; 4] = b"TZQ3";
 const QMAX_DEPTH: usize = 18;
 const M_PER_DEG: f64 = 111_320.0;
 const SAMPLES: i64 = 8;
-
-// Largest `q` the 3-byte C form can represent (2 * (2^22 - 1) + 16514).
-const Q_MAX: u64 = 2 * 0x3F_FFFF + 16514;
 
 pub struct QuadtreeSerializer {
     pub leaf_meters: f64,
@@ -72,47 +72,43 @@ impl Serializer for QuadtreeSerializer {
         let (nodes, leaves) = count(&root);
         eprintln!("quad: {nodes} nodes, {leaves} leaves");
 
-        // Sort tzids by how many leaves reference them, so the most common get
-        // the lowest ids (1-byte form A).  `none` (ocean) participates too.
-        let ntz = out.tz.len() + 1; // +1 for "none"
-        let mut refs = vec![0u64; ntz];
-        count_refs(&root, &mut refs);
-        let mut order: Vec<usize> = (0..ntz).collect();
+        // Ocean is encoded specially (length-0 leaf, no tzid), so only the real
+        // timezones go in the table.  Sort them by how many leaves reference
+        // them, so the most common gets id 0 (1-byte form A).
+        let ocean = none_id; // sentinel value stored in ocean leaves
+        let mut refs = vec![0u64; out.tz.len()];
+        count_refs(&root, &mut refs, ocean);
+        let mut order: Vec<usize> = (0..out.tz.len()).collect();
         order.sort_by(|&x, &y| refs[y].cmp(&refs[x]).then(x.cmp(&y)));
-        // remap[old_id] = new rank
-        let mut remap = vec![0u64; ntz];
+        // remap[old_id] = new rank (ocean leaves keep the sentinel unchanged)
+        let mut remap = vec![0u64; out.tz.len()];
         for (rank, &old) in order.iter().enumerate() {
             remap[old] = rank as u64;
         }
-        remap_leaves(&mut root, &remap);
-        // names[rank] — empty for "none"
-        let names: Vec<&str> = order
-            .iter()
-            .map(|&old| if old as u64 == none_id { "" } else { out.tz[old].n.as_str() })
-            .collect();
+        remap_leaves(&mut root, &remap, ocean);
+        let names: Vec<&str> = order.iter().map(|&old| out.tz[old].n.as_str()).collect();
 
         eprintln!(
-            "quad: {} tzids used in form A (1-byte), {} in form B; ocean rank {}",
+            "quad: {} tzids in form A (1-byte), {} in form B; ocean is length-0",
             order.iter().take(128).filter(|&&o| refs[o] > 0).count(),
-            order.iter().skip(128).filter(|&&o| refs[o] > 0).count(),
-            remap[none_id as usize]
+            order.iter().skip(128).filter(|&&o| refs[o] > 0).count()
         );
 
         // Self-check against exact brute-force lookup (misses are near borders).
-        let agree = self_verify(out, &root, &names, 4000);
+        let agree = self_verify(out, &root, &names, ocean, 4000);
         eprintln!("quad: {agree:.2}% of 4000 random points match exact lookup (rest are near borders)");
 
         // Encode.
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
-        encode_node(&root, &mut buf)?;
+        encode_node(&root, &mut buf, ocean)?;
         write_q(&mut buf, names.len() as u64);
         for name in &names {
             write_q(&mut buf, name.len() as u64);
             buf.extend_from_slice(name.as_bytes());
         }
 
-        verify_roundtrip(&buf, &root)?;
+        verify_roundtrip(&buf, &root, ocean)?;
         Ok(buf)
     }
 
@@ -318,78 +314,49 @@ fn count(node: &QNode) -> (usize, usize) {
     }
 }
 
-fn count_refs(node: &QNode, refs: &mut [u64]) {
+// Count leaf references per real tzid (ocean leaves are excluded — ocean has no
+// table entry).
+fn count_refs(node: &QNode, refs: &mut [u64], ocean: u64) {
     match node {
-        QNode::Leaf(t) => refs[*t as usize] += 1,
-        QNode::Internal(ch) => ch.iter().for_each(|c| count_refs(c, refs)),
+        QNode::Leaf(t) => {
+            if *t != ocean {
+                refs[*t as usize] += 1;
+            }
+        }
+        QNode::Internal(ch) => ch.iter().for_each(|c| count_refs(c, refs, ocean)),
     }
 }
 
-fn remap_leaves(node: &mut QNode, remap: &[u64]) {
+fn remap_leaves(node: &mut QNode, remap: &[u64], ocean: u64) {
     match node {
-        QNode::Leaf(t) => *t = remap[*t as usize],
-        QNode::Internal(ch) => ch.iter_mut().for_each(|c| remap_leaves(c, remap)),
-    }
-}
-
-// --- the `q` integer code ---
-
-/// Smallest representable `q` >= n (identity below 16512; rounds up to an even
-/// value in the form-C range).
-fn representable(n: u64) -> u64 {
-    if n <= 16511 {
-        n
-    } else {
-        let r = n.max(16514);
-        r + (r & 1) // make even
-    }
-}
-
-fn write_q(buf: &mut Vec<u8>, q: u64) {
-    if q <= 127 {
-        buf.push(q as u8); // A: 0aaaaaaa
-    } else if q <= 16511 {
-        let a = q - 128; // 14 bits
-        buf.push(0x80 | (a >> 8) as u8); // B: 10aaaaaa aaaaaaaa
-        buf.push((a & 0xFF) as u8);
-    } else {
-        // C: even q only
-        let a = (q - 16514) / 2; // 22 bits
-        buf.push(0xC0 | (a >> 16) as u8);
-        buf.push(((a >> 8) & 0xFF) as u8);
-        buf.push((a & 0xFF) as u8);
-    }
-}
-
-fn read_q(bytes: &[u8], pos: &mut usize) -> u64 {
-    let b0 = bytes[*pos] as u64;
-    *pos += 1;
-    if b0 < 0x80 {
-        b0
-    } else if b0 < 0xC0 {
-        let a = ((b0 & 0x3F) << 8) | bytes[*pos] as u64;
-        *pos += 1;
-        a + 128
-    } else {
-        let a = ((b0 & 0x3F) << 16) | ((bytes[*pos] as u64) << 8) | bytes[*pos + 1] as u64;
-        *pos += 2;
-        2 * a + 16514
+        QNode::Leaf(t) => {
+            if *t != ocean {
+                *t = remap[*t as usize];
+            }
+        }
+        QNode::Internal(ch) => ch.iter_mut().for_each(|c| remap_leaves(c, remap, ocean)),
     }
 }
 
 // --- encoding ---
 
-fn encode_node(node: &QNode, buf: &mut Vec<u8>) -> Result<(), String> {
+fn encode_node(node: &QNode, buf: &mut Vec<u8>, ocean: u64) -> Result<(), String> {
     match node {
         QNode::Leaf(tzid) => {
-            write_q(buf, 0); // leaf marker (length 0)
-            write_q(buf, *tzid);
+            if *tzid == ocean {
+                write_q(buf, 0); // ocean leaf: length 0, no tzid follows
+            } else {
+                write_q(buf, 1); // non-ocean leaf: length 1, then the tzid
+                write_q(buf, *tzid);
+            }
         }
         QNode::Internal(children) => {
             let mut payload = Vec::new();
             for c in children.iter() {
-                encode_node(c, &mut payload)?;
+                encode_node(c, &mut payload, ocean)?;
             }
+            // Lengths 0 and 1 are leaf markers; an internal payload is at least 4
+            // bytes (four 1-byte ocean children), so `len` never collides.
             let len = representable(payload.len() as u64);
             if len > Q_MAX {
                 return Err(format!(
@@ -412,18 +379,23 @@ fn encode_node(node: &QNode, buf: &mut Vec<u8>) -> Result<(), String> {
 fn skip_node(bytes: &[u8], pos: &mut usize) {
     let len = read_q(bytes, pos);
     if len == 0 {
+        // ocean leaf: nothing follows
+    } else if len == 1 {
         read_q(bytes, pos); // skip tzid
     } else {
         *pos += len as usize; // skip payload (incl. padding)
     }
 }
 
-fn lookup_encoded(bytes: &[u8], point: Pt) -> u64 {
+fn lookup_encoded(bytes: &[u8], point: Pt, ocean: u64) -> u64 {
     let mut pos = 4; // past magic
     let mut cell = ROOT_CELL;
     loop {
         let len = read_q(bytes, &mut pos);
         if len == 0 {
+            return ocean;
+        }
+        if len == 1 {
             return read_q(bytes, &mut pos);
         }
         let q = quadrant_for_point(&cell, point);
@@ -444,7 +416,7 @@ fn lookup_tree(node: &QNode, cell: &Aabb, point: Pt) -> u64 {
     }
 }
 
-fn verify_roundtrip(bytes: &[u8], root: &QNode) -> Result<(), String> {
+fn verify_roundtrip(bytes: &[u8], root: &QNode, ocean: u64) -> Result<(), String> {
     let mut seed = 0x9E3779B97F4A7C15u64;
     for _ in 0..2000 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -453,7 +425,7 @@ fn verify_roundtrip(bytes: &[u8], root: &QNode) -> Result<(), String> {
         let y = ROOT_CELL[0][1] + ((seed >> 33) as i64 % (ROOT_CELL[1][1] - ROOT_CELL[0][1]));
         let p = [x, y];
         let a = lookup_tree(root, &ROOT_CELL, p);
-        let b = lookup_encoded(bytes, p);
+        let b = lookup_encoded(bytes, p, ocean);
         if a != b {
             return Err(format!("quad encode round-trip mismatch at {p:?}: tree {a} != encoded {b}"));
         }
@@ -461,7 +433,7 @@ fn verify_roundtrip(bytes: &[u8], root: &QNode) -> Result<(), String> {
     Ok(())
 }
 
-fn self_verify(out: &Output, root: &QNode, names: &[&str], samples: usize) -> f64 {
+fn self_verify(out: &Output, root: &QNode, names: &[&str], ocean: u64, samples: usize) -> f64 {
     let mut seed = 0xD1B54A32D192ED03u64;
     let mut agree = 0usize;
     for _ in 0..samples {
@@ -471,7 +443,8 @@ fn self_verify(out: &Output, root: &QNode, names: &[&str], samples: usize) -> f6
         let y = ROOT_CELL[0][1] + ((seed >> 33) as i64 % (ROOT_CELL[1][1] - ROOT_CELL[0][1]));
         let p = [x, y];
 
-        let rough = names[lookup_tree(root, &ROOT_CELL, p) as usize];
+        let v = lookup_tree(root, &ROOT_CELL, p);
+        let rough = if v == ocean { "" } else { names[v as usize] };
         let mut best: Option<usize> = None;
         for z in &out.zones {
             if geom::rings_contain_point(&z.outer, &z.holes, p)
@@ -493,55 +466,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn q_roundtrip() {
-        for q in [0u64, 1, 127, 128, 129, 16511, 16514, 16516, 100000, Q_MAX] {
-            let mut buf = Vec::new();
-            write_q(&mut buf, q);
-            let mut pos = 0;
-            assert_eq!(read_q(&buf, &mut pos), q, "q={q}");
-            assert_eq!(pos, buf.len());
-        }
-    }
-
-    #[test]
-    fn q_form_sizes() {
-        // A is 1 byte (q<=127), B is 2 (q<=16511), C is 3.
-        let sz = |q| {
-            let mut b = Vec::new();
-            write_q(&mut b, q);
-            b.len()
-        };
-        assert_eq!(sz(0), 1);
-        assert_eq!(sz(127), 1);
-        assert_eq!(sz(128), 2);
-        assert_eq!(sz(16511), 2);
-        assert_eq!(sz(16514), 3);
-    }
-
-    #[test]
-    fn representable_is_exact_below_c() {
-        for n in [0u64, 1, 8, 127, 128, 16511] {
-            assert_eq!(representable(n), n);
-        }
-        assert_eq!(representable(16512), 16514);
-        assert_eq!(representable(16515), 16516);
-    }
-
-    #[test]
     fn encode_decode_tree() {
+        let ocean = 5000u64;
         let tree = QNode::Internal(Box::new([
             QNode::Leaf(3),
-            QNode::Internal(Box::new([QNode::Leaf(1), QNode::Leaf(1), QNode::Leaf(2), QNode::Leaf(0)])),
+            // NW child holds an ocean leaf (length-0, 1 byte) among others.
+            QNode::Internal(Box::new([QNode::Leaf(1), QNode::Leaf(ocean), QNode::Leaf(2), QNode::Leaf(0)])),
             QNode::Leaf(7),
             QNode::Leaf(200), // form B tzid
         ]));
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
-        encode_node(&tree, &mut buf).unwrap();
-        assert_eq!(lookup_encoded(&buf, [ROOT_CELL[1][0] - 1, ROOT_CELL[1][1] - 1]), 3);
-        assert_eq!(lookup_encoded(&buf, [ROOT_CELL[0][0], ROOT_CELL[0][1]]), 7);
+        encode_node(&tree, &mut buf, ocean).unwrap();
+        assert_eq!(lookup_encoded(&buf, [ROOT_CELL[1][0] - 1, ROOT_CELL[1][1] - 1], ocean), 3);
+        assert_eq!(lookup_encoded(&buf, [ROOT_CELL[0][0], ROOT_CELL[0][1]], ocean), 7);
         for p in [[100, 100], [-100, -100], [500, -9], [ROOT_CELL[0][0], ROOT_CELL[1][1] - 1]] {
-            assert_eq!(lookup_tree(&tree, &ROOT_CELL, p), lookup_encoded(&buf, p));
+            assert_eq!(lookup_tree(&tree, &ROOT_CELL, p), lookup_encoded(&buf, p, ocean));
         }
     }
 }

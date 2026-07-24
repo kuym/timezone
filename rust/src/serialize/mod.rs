@@ -10,6 +10,7 @@ use crate::build::Output;
 pub mod binary;
 pub mod json;
 pub mod quad;
+mod qvarint;
 
 /// Turns a built `Output` into a byte stream in some concrete format.
 pub trait Serializer {
