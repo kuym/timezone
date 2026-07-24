@@ -86,6 +86,11 @@ driver is format-agnostic and a new format is one `impl`:
   represent. Every section is validated by a decode round-trip against the source.
   The full layout is documented at the top of `serialize/binary.rs`.
 
+  The reference reader is `../tzlookup_binary.js` (Node + browser): it parses the
+  binary and resolves points by reusing `tzlookup.js`'s descent + localized
+  point-in-polygon (agreeing 100% with the JSON reader). Run
+  `node tzlookup_binary.js tz.bin 38.5,-98.5` (arguments are `lat,lon`).
+
 - **`quad`** (experimental, Rust-only) — a very compact quadtree with **no
   polygons**. It builds its own rough tree from the zone geometry: split until a
   cell is homogeneous (one tzid) or its longest edge (in metres, at the cell's
