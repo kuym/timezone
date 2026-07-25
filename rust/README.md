@@ -5,10 +5,15 @@ dependencies). It reads the GeoJSON timezone dataset, quantizes and simplifies
 the polygons, builds a cost-model-driven quadtree, verifies it against brute
 force, and serializes it.
 
-**It is byte-for-byte identical to the JavaScript compressor.** For any given
-set of options the `quadtree.json` it emits is exactly the same file
-`tzconvert.js` produces (verified across op-limit, split-budget, and epsilon
-variations). See "Parity" below.
+**Parity note.** Through the pre-topology era the emitted `quadtree.json` was
+byte-for-byte identical to what `tzconvert.js` produces (verified across
+op-limit, split-budget, and epsilon variations — see "Parity" below, and the
+quantize/RDP/heap details that make it exact). The Rust encoder has since gained
+**topological shared-arc geometry** (and optional Visvalingam–Whyatt lossy
+simplification), which the legacy JS builder does not emit — so for the current
+default the two outputs differ in the geometry representation. The reader
+(`tzlookup.js`) handles both: it rebuilds rings from `arcs` when present, and
+falls back to the old per-zone `o`/`p` packing otherwise.
 
 ## Build & run
 
@@ -28,6 +33,7 @@ cd ..
 | `--max-ops=N` | 500 | per-leaf lookup cost budget; leaves over it split |
 | `--max-splits=N` | unlimited | hard cap on splits; **takes precedence** over `--max-ops` |
 | `--epsilon=N` | 8 | RDP simplification tolerance, in quantized units |
+| `--vw=F` | 1.0 | (json/binary) Visvalingam–Whyatt: keep fraction F of each shared arc's vertices; 1.0 = lossless |
 | `--verify=N` | 3000 | random points cross-checked against brute force (0 disables) |
 | `--format=json\|binary` | json | output serializer (binary is a **stub**, see below) |
 | `--input=PATH` | data/combined.json | GeoJSON FeatureCollection |
@@ -57,9 +63,10 @@ driver is format-agnostic and a new format is one `impl`:
 - **`json`** — complete; produces the exact `quadtree.json` schema (see
   `../quadtree.md`), compact and with the same key ordering as the JS writer.
 - **`binary`** — full-artifact compact format, **complete** (`is_complete()` is
-  true). ~42% smaller than `json` (1.08 MB vs 1.87 MB) — no base64, plus the
-  quadtree optimizations. Four sections after a fixed header (magic `TZQT`,
-  version, quant block, counts):
+  true). **887 KB** lossless (`--vw=1.0`) — no base64, the quadtree optimizations,
+  and topological shared-arc geometry. `--vw` trades accuracy for size (e.g.
+  ~600 KB at `--vw=0.5`, ~440 KB at `--vw=0.25`). Four sections after a fixed
+  header (magic `TZQT`, version, quant block, counts incl. arc count):
 
   1. **quadtree** — reuses the `quad` format's primitives (the `q` varint in
      `serialize/qvarint.rs`, plus recursive length-prefixed skippable nodes) but
@@ -74,10 +81,14 @@ driver is format-agnostic and a new format is one `impl`:
      - *(Not done, to keep the decoder fast/low-memory: dropping the per-leaf
        length prefix — parse-to-skip; and omitting the localized data to recompute
        it at load — O(ring) per candidate.)*
-  2. **zones** — one record per zone in rank order: `tzid`, area, aabb, then each
-     ring as an origin + the **same packed delta stream as `json` (`polycodec`),
-     but stored raw (no base64) behind a length prefix**.
-  3. **tz names** — length-prefixed UTF-8, indexed by tzid.
+  2. **arcs** — the shared polygon boundaries (topology). Adjacent zones share
+     ~80% of their edges; each unique arc is stored once as an origin + packed
+     delta stream (`polycodec`, raw, no base64). This is where the geometry lives.
+  3. **zones** — one record per zone in rank order: `tzid`, area, aabb, then the
+     outer ring and each hole as a list of **arc references** (`(index<<1)|reversed`),
+     not vertices. A reader rebuilds the ring by concatenating the referenced arcs
+     (see `topology::reconstruct`).
+  4. **tz names** — length-prefixed UTF-8, indexed by tzid.
 
   Two integer encodings appear: the `q` varint (small/paddable values — tree
   structure) and, in the zones section, an **exact** varint (`q` byte-count + that

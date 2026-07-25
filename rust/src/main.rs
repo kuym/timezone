@@ -9,6 +9,7 @@ mod geom;
 mod lookup;
 mod polycodec;
 mod quant;
+pub mod topology;
 mod serialize;
 
 use serde::Deserialize;
@@ -57,6 +58,7 @@ struct Options {
     max_splits: Option<usize>,
     verify: usize,
     leaf_km: f64,
+    vw: f64,
 }
 
 const HELP: &str = "\
@@ -79,21 +81,25 @@ OPTIONS:
                                                                  [default: unlimited]
     --leaf-km=N        (quad format) stop splitting a cell once its longest edge is
                        under N km; the majority-area tzid wins.        [default: 10]
+    --vw=F             (json/binary) Visvalingam–Whyatt lossy simplification: keep
+                       fraction F (0.0..=1.0) of each shared arc's vertices.
+                       1.0 = lossless (no simplification).             [default: 1.0]
     --verify=N         Cross-check N random points against brute force (0 disables).
                                                                      [default: 3000]
     -h, --help         Print this help and exit.
 
 FORMATS:
-    json     Full quadtree + packed polygons; the quadtree.json schema (see
-             quadtree.md). Byte-for-byte identical to the JavaScript build.
-    binary   Compact binary of the full artifact (quadtree + packed polygons,
-             no base64); ~42% smaller than json. See rust/README.md.
+    json     Full quadtree + polygons stored as shared topological arcs (the
+             quadtree.json schema; see quadtree.md).
+    binary   Compact binary of the full artifact (quadtree + shared arcs, no
+             base64). ~18% smaller than json's arcs, lossless. See rust/README.md.
     quad     Experimental. A tiny quadtree with NO polygons: every leaf resolves
              to one tzid (majority area at the --leaf-km limit). See rust/README.md.
 
 EXAMPLES:
     tzconvert --input=data/combined.json quadtree.json
     tzconvert --max-ops=250 --max-splits=2000 quadtree.json
+    tzconvert --format=binary --vw=0.5 tz.bin
     tzconvert --format=quad --leaf-km=10 tz.quad
 
 Run from the project root so the default --input path resolves.";
@@ -108,6 +114,7 @@ fn parse_args() -> Result<Options, String> {
         max_splits: None,
         verify: 3000,
         leaf_km: 10.0,
+        vw: 1.0,
     };
     for arg in std::env::args().skip(1) {
         if arg == "--help" || arg == "-h" {
@@ -127,6 +134,12 @@ fn parse_args() -> Result<Options, String> {
             opt.verify = v.parse().map_err(|_| format!("bad --verify: {v}"))?;
         } else if let Some(v) = arg.strip_prefix("--leaf-km=") {
             opt.leaf_km = v.parse().map_err(|_| format!("bad --leaf-km: {v}"))?;
+        } else if let Some(v) = arg.strip_prefix("--vw=") {
+            let f: f64 = v.parse().map_err(|_| format!("bad --vw: {v}"))?;
+            if !(0.0..=1.0).contains(&f) {
+                return Err(format!("--vw must be in 0.0..=1.0 (got {f})"));
+            }
+            opt.vw = f;
         } else if arg.starts_with("--") {
             return Err(format!("unknown option: {arg}"));
         } else {
@@ -220,6 +233,14 @@ fn run() -> Result<(), String> {
     // serialize them (json, binary).  Formats that build their own tree (quad)
     // skip this whole phase.
     if serializer.uses_cost_tree() {
+        let orig_verts: usize = out.zones.iter().map(|z| z.outer.len() + z.holes.iter().map(|h| h.len()).sum::<usize>()).sum();
+        eprintln!("building topology (shared arcs) ...");
+        let (n_arcs, arc_verts) = out.build_topology(opt.vw);
+        eprintln!(
+            "topology: {{\"arcs\":{},\"arcVerts\":{},\"ringVerts\":{},\"vw\":{}}}",
+            n_arcs, arc_verts, orig_verts, opt.vw
+        );
+
         eprintln!(
             "subdividing (max-ops={}, max-splits={}) ...",
             opt.max_ops,

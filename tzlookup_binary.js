@@ -144,11 +144,17 @@
     return node;
   }
 
-  function readRing(c) {
-    const ox = c.coord();
-    const oy = c.coord();
-    const pLen = c.uintLE();
-    return { o: [ox, oy], praw: c.take(pLen) };
+  // A ring's arc references: count, then each (arcIndex<<1|reversed) as uintLE,
+  // returned in the signed convention tzlookup.reconstructRing expects
+  // (i forward, -i-1 reversed).
+  function readArcRefs(c) {
+    const n = c.q();
+    const refs = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = c.uintLE();
+      refs[i] = (v & 1) ? -(v >> 1) - 1 : (v >> 1);
+    }
+    return refs;
   }
 
   function bufToStr(bytes) {
@@ -158,7 +164,7 @@
 
   function BinaryReader(bytes) {
     this.b = bytes;
-    if (bytes.length < 52 || String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== MAGIC) {
+    if (bytes.length < 56 || String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== MAGIC) {
       throw Error("not a binary tz file (bad magic)");
     }
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -173,16 +179,29 @@
     const zoneCount = dv.getUint32(40, true);
     const tzCount = dv.getUint32(44, true);
     this.nodeCount = dv.getUint32(48, true);
+    const arcCount = dv.getUint32(52, true);
     this.rootCell = [[this.xMin, this.yMin], [this.xMax, this.yMax]];
 
     const c = new Cursor(bytes);
-    c.pos = 52;
+    c.pos = 56;
 
     // section 1: quadtree
     this.quadtree = parseNode(c);
 
-    // section 2: zones (rank order; rings decoded lazily).  Record each record's
-    // byte offset so a lookup can report the file position of a zone it reads.
+    // section 2: arcs (shared boundaries; decoded to vertices lazily).  Record
+    // each arc's byte offset for seek reporting.
+    this._arcMeta = new Array(arcCount);
+    this._arcs = new Array(arcCount);
+    this.arcOffset = new Array(arcCount);
+    for (let i = 0; i < arcCount; i++) {
+      this.arcOffset[i] = c.pos;
+      const ox = c.coord(), oy = c.coord();
+      const pLen = c.uintLE();
+      this._arcMeta[i] = { o: [ox, oy], praw: c.take(pLen) };
+    }
+
+    // section 3: zones (rank order) — metadata + arc references.  Record each
+    // record's byte offset so a lookup can report the file position it reads.
     this.zones = new Array(zoneCount);
     this.zoneOffset = new Array(zoneCount);
     for (let rank = 0; rank < zoneCount; rank++) {
@@ -191,17 +210,17 @@
       const area = c.uintLE();
       const xLo = c.coord(), yLo = c.coord();
       const w = c.uintLE(), h = c.uintLE();
-      const outer = readRing(c);
+      const outerRefs = readArcRefs(c);
       const holeCount = c.q();
-      const hraw = new Array(holeCount);
-      for (let i = 0; i < holeCount; i++) { hraw[i] = readRing(c); }
+      const holeRefs = new Array(holeCount);
+      for (let i = 0; i < holeCount; i++) { holeRefs[i] = readArcRefs(c); }
       this.zones[rank] = {
         tzid: tzid, a: area, aabb: [[xLo, yLo], [xLo + w, yLo + h]],
-        o: outer.o, praw: outer.praw, hraw: hraw,
+        outerRefs: outerRefs, holeRefs: holeRefs,
       };
     }
 
-    // section 3: tz names (indexed by tzid)
+    // section 4: tz names (indexed by tzid)
     const nNames = c.q();
     this.tzNames = new Array(tzCount);
     for (let i = 0; i < nNames; i++) {
@@ -210,13 +229,36 @@
     }
   }
 
-  // Decode a zone's rings on first use (memoized on the record, so tzlookup's
-  // zoneRings picks them up from `.outer`/`.holes`).
+  // Decode one arc's vertices on first use.
+  BinaryReader.prototype._arc = function (idx) {
+    if (!this._arcs[idx]) {
+      const a = this._arcMeta[idx];
+      this._arcs[idx] = polycodec.decodePolygon(a.o, a.praw);
+    }
+    return this._arcs[idx];
+  };
+
+  // Rebuild a zone's outer/holes from its arc references (memoized on the record,
+  // so tzlookup's zoneRings picks them up from `.outer`/`.holes`).
   BinaryReader.prototype._rings = function (zone) {
     if (!zone.outer) {
-      zone.outer = polycodec.decodePolygon(zone.o, zone.praw);
-      zone.holes = zone.hraw.map(function (h) { return polycodec.decodePolygon(h.o, h.praw); });
+      const self = this;
+      const build = function (refs) {
+        refs.forEach(function (s) { self._arc(s < 0 ? -s - 1 : s); });
+        return tzlookup.reconstructRing(self._arcs, refs);
+      };
+      zone.outer = build(zone.outerRefs);
+      zone.holes = zone.holeRefs.map(build);
     }
+  };
+
+  // The distinct arc byte offsets a lookup reads to rebuild a zone's rings.
+  BinaryReader.prototype._arcSeeks = function (zone) {
+    const self = this, offs = [];
+    const add = function (s) { offs.push(self.arcOffset[s < 0 ? -s - 1 : s]); };
+    zone.outerRefs.forEach(add);
+    zone.holeRefs.forEach(function (r) { r.forEach(add); });
+    return offs;
   };
 
   // Resolve a longitude/latitude to a timezone.  Mirrors tzlookup.resolve, but
@@ -250,18 +292,24 @@
     const treeSeeks = seeks.length;
 
     let best = null;
+    let zoneSeeks = 0, arcSeeks = 0;
     for (let i = 0; i < hit.definite.length; i++) { // eref zones (definitive)
       const rank = hit.definite[i];
       seeks.push(this.zoneOffset[rank]); // read the zone record (tzid, area)
+      zoneSeeks++;
       const z = this.zones[rank];
       if (best === null || z.a < best.a) { best = z; }
     }
     for (let i = 0; i < hit.candidates.length; i++) {
       const cand = hit.candidates[i];
-      seeks.push(this.zoneOffset[cand.z]); // read the zone record (incl. polygon)
       const zone = this.zones[cand.z];
+      seeks.push(this.zoneOffset[cand.z]); // the zone record (metadata + arc refs)
+      zoneSeeks++;
+      const arcs = this._arcSeeks(zone); // then each referenced arc, to rebuild the ring
+      for (let a = 0; a < arcs.length; a++) { seeks.push(arcs[a]); }
+      arcSeeks += arcs.length;
       this._rings(zone);
-      if (tzlookup.localContainsZone(zone, hit.cell, cand, point, stats)) {
+      if (tzlookup.localContainsZone(zone, hit.cell, cand, point, stats, this._arcs)) {
         if (best === null || zone.a < best.a) { best = zone; }
       }
     }
@@ -273,7 +321,8 @@
       x: x, y: y, definite: definite,
       depth: stats.depth, candidates: stats.candidates, vertices: stats.vertices,
       ops: stats.depth + 2 * stats.vertices,
-      seeks: seeks, seekCount: seeks.length, treeSeeks: treeSeeks, zoneSeeks: seeks.length - treeSeeks,
+      seeks: seeks, seekCount: seeks.length,
+      treeSeeks: treeSeeks, zoneSeeks: zoneSeeks, arcSeeks: arcSeeks,
     };
   };
 
@@ -322,7 +371,7 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
       "   depth " + r.depth + "   candidates tested " + r.candidates +
       "   vertices evaluated " + r.vertices + "   ~" + r.ops + " ops");
     console.log("  seeks performed: " + r.seekCount +
-      " (" + r.treeSeeks + " quadtree-descent + " + r.zoneSeeks + " zone-record)");
+      " (" + r.treeSeeks + " quadtree-descent + " + r.zoneSeeks + " zone-record + " + r.arcSeeks + " arc)");
     console.log("  seek byte offsets: [" + r.seeks.join(", ") + "]\n");
   }
   console.log("lookups performed: " + points.length +

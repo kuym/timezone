@@ -60,12 +60,47 @@
     return {definite: definite, candidates: candidates, path: path, cell: cell};
   }
 
+  // Decode all shared arcs of a topology artifact once, memoized on the db.
+  // Each arc is an origin + packed delta stream, decoded to absolute vertices.
+  function decodeArcs(db) {
+    if (!db._arcs) {
+      db._arcs = (db.arcs || []).map(function(a) {
+        return polycodec.decodePolygon(a.o, polycodec.base64ToBytes(a.p));
+      });
+    }
+    return db._arcs;
+  }
+
+  // Rebuild a ring from signed arc references (i = arc i forward, -i-1 reversed),
+  // concatenating arcs and dropping the junction shared with the previous arc and
+  // the final closure.  Mirrors topology::reconstruct in the Rust build.
+  function reconstructRing(arcs, refs) {
+    const ring = [];
+    for (let k = 0; k < refs.length; k++) {
+      const s = refs[k], rev = s < 0, arc = arcs[rev ? -s - 1 : s];
+      const start = k > 0 ? 1 : 0; // drop the shared junction
+      if (rev) {
+        for (let i = arc.length - start - 1; i >= 0; i--) { ring.push(arc[i]); }
+      } else {
+        for (let i = start; i < arc.length; i++) { ring.push(arc[i]); }
+      }
+    }
+    ring.pop(); // the concatenation ends back at the start junction (the closure)
+    return ring;
+  }
+
   // Decode a zone's rings on first use and memoize them on the record.  Handles
-  // both the exported artifact (origin + packed deltas in `o`/`p`/`h`) and the
-  // builder's in-memory pre-export zones (`outer`/`holes` already decoded).
-  function zoneRings(zone) {
+  // the topology artifact (`outer`/`h` are arc-reference integer lists, rebuilt
+  // from `arcs`), the older packed artifact (origin + deltas in `o`/`p`/`h`), and
+  // the builder's in-memory zones (`outer`/`holes` already decoded to points).
+  function zoneRings(zone, arcs) {
     if (!zone._rings) {
-      if (zone.outer) {
+      if (arcs && zone.outer && typeof zone.outer[0] === "number") {
+        zone._rings = {
+          outer: reconstructRing(arcs, zone.outer),
+          holes: (zone.h || []).map(function(r) { return reconstructRing(arcs, r); })
+        };
+      } else if (zone.outer) {
         zone._rings = {outer: zone.outer, holes: zone.holes || []};
       } else {
         zone._rings = {
@@ -135,8 +170,8 @@
   // `h` = [{i, w, e}] for each hole that crosses the cell (holes that do not
   // cross cannot change the answer for any point in the cell, so they are
   // omitted).  Falls back to the full test on any degeneracy.
-  function localContainsZone(zone, cell, cand, point, stats) {
-    const rings = zoneRings(zone);
+  function localContainsZone(zone, cell, cand, point, stats, arcs) {
+    const rings = zoneRings(zone, arcs);
     const C = cellCenter(cell);
 
     const outerDelta = segmentCrossings(C, point, rings.outer, cand.e, stats);
@@ -159,7 +194,7 @@
     return true;
   }
 
-  function pointInZone(zone, point, stats) {
+  function pointInZone(zone, point, stats, arcs) {
     // Cheap reject before decoding anything.
     if (zone.aabb) {
       if (point[0] < zone.aabb[0][0] || point[0] > zone.aabb[1][0] ||
@@ -167,7 +202,7 @@
         return false;
       }
     }
-    const rings = zoneRings(zone);
+    const rings = zoneRings(zone, arcs);
     if (stats) { stats.vertices += fullRingVertices(rings); }
     return geom.RingsContainPoint(rings.outer, rings.holes, point);
   }
@@ -213,6 +248,7 @@
   // are no candidates (the common case) this is still test-free.
   function resolve(db, point) {
     const hit = probe(db.quadtree, db.rootCell, point);
+    const arcs = db.arcs ? decodeArcs(db) : null; // topology artifact
     const matches = [];
 
     // Cost accounting, so a caller can gauge the work a lookup took:
@@ -237,8 +273,8 @@
       const cand = hit.candidates[i];
       const zone = zoneOf(db, cand);
       const inside = (cand && cand.e)?
-        localContainsZone(zone, hit.cell, cand, point, stats) :
-        pointInZone(zone, point, stats);
+        localContainsZone(zone, hit.cell, cand, point, stats, arcs) :
+        pointInZone(zone, point, stats, arcs);
       if (inside) { matches.push(zone); }
     }
 
@@ -255,6 +291,8 @@
     quadrantForPoint: quadrantForPoint,
     probe: probe,
     zoneRings: zoneRings,
+    decodeArcs: decodeArcs,
+    reconstructRing: reconstructRing,
     pointInZone: pointInZone,
     localContainsZone: localContainsZone,
     cellCenter: cellCenter,

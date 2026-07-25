@@ -23,7 +23,7 @@
 //!   header:
 //!     magic "TZQT", version:u16
 //!     quant: xMin,xMax,yMin,yMax : i32 ; xScale,yScale : f64 ; maxDepth : u16
-//!     counts: zones:u32, tz:u32, nodes:u32
+//!     counts: zones:u32, tz:u32, nodes:u32, arcs:u32
 //!   section 1 — quadtree (one recursive node):
 //!     node := bodyLen:q                         (byte length of the body; skip = jump bodyLen)
 //!             hdr:q                             (bit0 = internal; bit1 = has eref;
@@ -37,27 +37,32 @@
 //!                  runCount × ( gap:q, len:q )        (run count comes from `packed`)
 //!                  [ holeCount:q, holeCount × ( i:q, w:zigzag-q, runsWithCount ) ] if hasHoles
 //!     runsWithCount := count:q, count × ( gap:q, len:q )
-//!   section 2 — zones (`zones` count entries, in rank order):
+//!   section 2 — arcs (`arcs` count entries — the shared polygon boundaries):
+//!     arc := ox:coord, oy:coord, pLen:uintLE, p:bytes   (polycodec packed, no base64)
+//!   section 3 — zones (`zones` count entries, in rank order):
 //!     zone := tzid:q
-//!             area:  byteLen:q, byteLen LE bytes         (unsigned, minimal little-endian)
-//!             aabb:  xLo:zigzag-q, yLo:zigzag-q, (xHi-xLo):q, (yHi-yLo):q
-//!             ring:  ox:zigzag-q, oy:zigzag-q, pLen:q, p:bytes   (polycodec packed, no base64)
-//!             holeCount:q, holeCount × ( ox:zigzag-q, oy:zigzag-q, pLen:q, p:bytes )
-//!   section 3 — tz names (`tz` count entries, indexed by tzid):
+//!             area:  uintLE
+//!             aabb:  xLo:coord, yLo:coord, (xHi-xLo):uintLE, (yHi-yLo):uintLE
+//!             outer: refCount:q, refCount × arcRef
+//!             holeCount:q, holeCount × ( refCount:q, refCount × arcRef )
+//!     arcRef := uintLE( (arcIndex << 1) | reversed )
+//!   section 4 — tz names (`tz` count entries, indexed by tzid):
 //!     tzCount:q, tzCount × ( nameLen:q, name:UTF-8 bytes )
 //! ```
 //!
-//! `windCode`: 0→w=0, 1→w=−1, 2→w=+1, 3→escape (full ZigZag w follows).  Runs are
-//! sorted, non-overlapping `[first, last]` edge ranges stored as gap-from-previous
-//! plus length.  A polygon `ring` is an origin (first vertex) plus a packed stream
-//! of deltas to the remaining vertices — decode with `polycodec::decode_polygon`.
+//! A zone's ring is rebuilt by concatenating its referenced arcs (reversed when
+//! the low bit is set), dropping the junction shared with the previous arc and
+//! the final closure — see `topology::reconstruct`.  `coord` = `unzigzag(uintLE)`;
+//! `uintLE` = a `q` byte-count then that many LE bytes (exact for any magnitude,
+//! unlike the even-only `q` 3-byte form).  `windCode`: 0→w=0, 1→w=−1, 2→w=+1,
+//! 3→escape (full ZigZag w follows).  Runs are sorted, non-overlapping
+//! `[first, last]` edge ranges stored as gap-from-previous plus length.
 
 use super::qvarint::{read_q, representable, unzigzag, write_q, zigzag, Q_MAX};
 use super::Serializer;
 use crate::build::{Cand, Output};
-use crate::geom::Pt;
-use crate::polycodec;
 use crate::quant;
+use crate::topology::ArcRef;
 
 const MAGIC: &[u8; 4] = b"TZQT";
 const VERSION: u16 = 0; // 0 = pre-release (geometry sections not yet implemented)
@@ -92,6 +97,7 @@ impl Serializer for BinarySerializer {
         buf.extend_from_slice(&(out.zones.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(out.tz.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(out.arena.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(out.arc_packed.len() as u32).to_le_bytes());
 
         // --- section 1: quadtree ---
         let tree_start = buf.len();
@@ -103,7 +109,16 @@ impl Serializer for BinarySerializer {
         }
         eprintln!("binary: quadtree section {} bytes ({} nodes)", pos - tree_start, out.arena.len());
 
-        // --- section 2: zones (polygon geometry) ---
+        // --- section 2: arcs (shared polygon boundaries) ---
+        let arcs_start = buf.len();
+        encode_arcs(out, &mut buf);
+        let mut apos = arcs_start;
+        if decode_arcs(&buf, &mut apos, out.arc_packed.len()) != source_arcs(out) {
+            return Err("binary arcs round-trip mismatch".to_string());
+        }
+        eprintln!("binary: arcs section {} bytes ({} arcs)", apos - arcs_start, out.arc_packed.len());
+
+        // --- section 3: zones (arc references + metadata) ---
         let zones_start = buf.len();
         encode_zones(out, &order, &mut buf);
         let mut zpos = zones_start;
@@ -112,7 +127,7 @@ impl Serializer for BinarySerializer {
         }
         eprintln!("binary: zones section {} bytes ({} polygons)", zpos - zones_start, out.zones.len());
 
-        // --- section 3: tz names ---
+        // --- section 4: tz names ---
         let tz_start = buf.len();
         encode_tz_names(out, &mut buf);
         let mut tpos = tz_start;
@@ -418,14 +433,23 @@ fn read_uint_le(bytes: &[u8], pos: &mut usize) -> u64 {
     v
 }
 
-// A ring as origin + packed delta stream (polycodec, no base64) behind an exact
-// varint length.
-fn write_ring(buf: &mut Vec<u8>, ring: &[Pt]) {
-    let (o, p) = polycodec::encode_polygon(ring);
-    write_coord(buf, o[0]);
-    write_coord(buf, o[1]);
-    write_uint_le(buf, p.len() as u64);
-    buf.extend_from_slice(&p);
+// Each arc as origin + packed delta stream (polycodec, no base64) behind an exact
+// varint length.  These are pre-packed in `out.arc_packed`.
+fn encode_arcs(out: &Output, buf: &mut Vec<u8>) {
+    for (o, p) in &out.arc_packed {
+        write_coord(buf, o[0]);
+        write_coord(buf, o[1]);
+        write_uint_le(buf, p.len() as u64);
+        buf.extend_from_slice(p);
+    }
+}
+
+// A ring's arc references: count, then each ref as (arcIndex << 1 | reversed).
+fn encode_arc_refs(refs: &[ArcRef], buf: &mut Vec<u8>) {
+    write_q(buf, refs.len() as u64);
+    for r in refs {
+        write_uint_le(buf, ((r.arc as u64) << 1) | r.rev as u64);
+    }
 }
 
 fn encode_zones(out: &Output, order: &[usize], buf: &mut Vec<u8>) {
@@ -437,10 +461,10 @@ fn encode_zones(out: &Output, order: &[usize], buf: &mut Vec<u8>) {
         write_coord(buf, zone.aabb[0][1]);
         write_uint_le(buf, (zone.aabb[1][0] - zone.aabb[0][0]) as u64);
         write_uint_le(buf, (zone.aabb[1][1] - zone.aabb[0][1]) as u64);
-        write_ring(buf, &zone.outer);
-        write_q(buf, zone.holes.len() as u64);
-        for hole in &zone.holes {
-            write_ring(buf, hole);
+        encode_arc_refs(&zone.outer_refs, buf);
+        write_q(buf, zone.hole_refs.len() as u64);
+        for hrefs in &zone.hole_refs {
+            encode_arc_refs(hrefs, buf);
         }
     }
 }
@@ -453,30 +477,45 @@ fn encode_tz_names(out: &Output, buf: &mut Vec<u8>) {
     }
 }
 
-// --- round-trip decoding for sections 2 & 3 ---
+// --- round-trip decoding for sections 2, 3 & 4 ---
 
 #[derive(PartialEq, Debug)]
-struct DecRing {
+struct DecArc {
     o: (i64, i64),
     p: Vec<u8>,
 }
 
+// An arc reference decodes to (arcIndex, reversed).
 #[derive(PartialEq, Debug)]
 struct DecZone {
     tzid: u64,
     area: u64,
     aabb: [i64; 4],
-    outer: DecRing,
-    holes: Vec<DecRing>,
+    outer: Vec<(u64, bool)>,
+    holes: Vec<Vec<(u64, bool)>>,
 }
 
-fn decode_ring(bytes: &[u8], pos: &mut usize) -> DecRing {
-    let ox = read_coord(bytes, pos);
-    let oy = read_coord(bytes, pos);
-    let plen = read_uint_le(bytes, pos) as usize;
-    let p = bytes[*pos..*pos + plen].to_vec();
-    *pos += plen;
-    DecRing { o: (ox, oy), p }
+fn decode_arcs(bytes: &[u8], pos: &mut usize, count: usize) -> Vec<DecArc> {
+    let mut arcs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let ox = read_coord(bytes, pos);
+        let oy = read_coord(bytes, pos);
+        let plen = read_uint_le(bytes, pos) as usize;
+        let p = bytes[*pos..*pos + plen].to_vec();
+        *pos += plen;
+        arcs.push(DecArc { o: (ox, oy), p });
+    }
+    arcs
+}
+
+fn decode_arc_refs(bytes: &[u8], pos: &mut usize) -> Vec<(u64, bool)> {
+    let n = read_q(bytes, pos);
+    (0..n)
+        .map(|_| {
+            let v = read_uint_le(bytes, pos);
+            (v >> 1, v & 1 == 1)
+        })
+        .collect()
 }
 
 fn decode_zones(bytes: &[u8], pos: &mut usize, count: usize) -> Vec<DecZone> {
@@ -488,20 +527,20 @@ fn decode_zones(bytes: &[u8], pos: &mut usize, count: usize) -> Vec<DecZone> {
         let yl = read_coord(bytes, pos);
         let xh = xl + read_uint_le(bytes, pos) as i64;
         let yh = yl + read_uint_le(bytes, pos) as i64;
-        let outer = decode_ring(bytes, pos);
+        let outer = decode_arc_refs(bytes, pos);
         let hn = read_q(bytes, pos);
-        let mut holes = Vec::with_capacity(hn as usize);
-        for _ in 0..hn {
-            holes.push(decode_ring(bytes, pos));
-        }
+        let holes = (0..hn).map(|_| decode_arc_refs(bytes, pos)).collect();
         zones.push(DecZone { tzid, area, aabb: [xl, yl, xh, yh], outer, holes });
     }
     zones
 }
 
-fn ring_to_dec(ring: &[Pt]) -> DecRing {
-    let (o, p) = polycodec::encode_polygon(ring);
-    DecRing { o: (o[0], o[1]), p }
+fn source_arcs(out: &Output) -> Vec<DecArc> {
+    out.arc_packed.iter().map(|(o, p)| DecArc { o: (o[0], o[1]), p: p.clone() }).collect()
+}
+
+fn refs_to_dec(refs: &[ArcRef]) -> Vec<(u64, bool)> {
+    refs.iter().map(|r| (r.arc as u64, r.rev)).collect()
 }
 
 fn source_zones(out: &Output, order: &[usize]) -> Vec<DecZone> {
@@ -513,8 +552,8 @@ fn source_zones(out: &Output, order: &[usize]) -> Vec<DecZone> {
                 tzid: z.tzid as u64,
                 area: z.a as u64,
                 aabb: [z.aabb[0][0], z.aabb[0][1], z.aabb[1][0], z.aabb[1][1]],
-                outer: ring_to_dec(&z.outer),
-                holes: z.holes.iter().map(|h| ring_to_dec(h)).collect(),
+                outer: refs_to_dec(&z.outer_refs),
+                holes: z.hole_refs.iter().map(|h| refs_to_dec(h)).collect(),
             }
         })
         .collect()

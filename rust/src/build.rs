@@ -8,6 +8,7 @@ use crate::geom::{self, Aabb, Pt};
 use crate::lookup::{cell_center, quadrant_for_point, segment_crossings, split_cell};
 use crate::polycodec;
 use crate::quant::{MAX_DEPTH, ROOT_CELL};
+use crate::topology::{self, ArcRef};
 
 // Lookup cost model: 1 op per quadtree level descended, 2 ops per ring edge
 // evaluated in the point-in-polygon test.
@@ -23,7 +24,10 @@ pub enum Rel {
 }
 
 /// A polygon record.  Carries build-time geometry (`outer`/`holes`) used by the
-/// verifier and packer, plus the packed fields (`o`/`p`/`h`) filled by `pack`.
+/// verifier and quadtree, plus the topological references (`outer_refs`/
+/// `hole_refs`) into `Output::arcs` filled by `build_topology`.  The rings are
+/// reconstructed from those arcs, so `outer`/`holes` always equal what a reader
+/// rebuilds from the serialized arcs.
 pub struct Zone {
     pub id: usize,
     pub tzid: usize,
@@ -32,9 +36,8 @@ pub struct Zone {
     pub outer: Vec<Pt>,
     pub holes: Vec<Vec<Pt>>,
     pub hole_aabbs: Vec<Aabb>,
-    pub o: Pt,
-    pub p: String,
-    pub h: Vec<(Pt, String)>,
+    pub outer_refs: Vec<ArcRef>,
+    pub hole_refs: Vec<Vec<ArcRef>>,
 }
 
 /// A timezone (a named group of zones).
@@ -75,12 +78,16 @@ impl Node {
     }
 }
 
-/// The whole built artifact.
+/// The whole built artifact.  `arcs` holds the shared polygon boundary arcs
+/// (topology); zones reference them.  `arc_packed` is the origin+delta packing of
+/// each arc, filled by `pack`.
 pub struct Output {
     pub arena: Vec<Node>,
     pub root: usize,
     pub zones: Vec<Zone>,
     pub tz: Vec<Tz>,
+    pub arcs: Vec<Vec<Pt>>,
+    pub arc_packed: Vec<(Pt, Vec<u8>)>,
     tz_index: HashMap<String, usize>,
 }
 
@@ -108,6 +115,8 @@ impl Output {
             root: 0,
             zones: Vec::new(),
             tz: Vec::new(),
+            arcs: Vec::new(),
+            arc_packed: Vec::new(),
             tz_index: HashMap::new(),
         }
     }
@@ -139,13 +148,102 @@ impl Output {
             outer,
             holes,
             hole_aabbs,
-            o: [0, 0],
-            p: String::new(),
-            h: Vec::new(),
+            outer_refs: Vec::new(),
+            hole_refs: Vec::new(),
         });
         self.tz[tzid].refs.push(id);
         self.arena[self.root].refz.push(id);
         Some(id)
+    }
+
+    /// Factor every zone's rings into shared arcs (topology), optionally
+    /// Visvalingam–Whyatt-simplifying each arc (`vw` < 1.0 = lossy), then rebuild
+    /// each zone's rings from the arcs.  Must run before `subdivide`: it replaces
+    /// `outer`/`holes` (and recomputes `aabb`/`a`) with the reconstructed geometry
+    /// the quadtree and the readers both work from.  Returns (arc count, total arc
+    /// vertices) for reporting.
+    pub fn build_topology(&mut self, vw: f64) -> (usize, usize) {
+        // Flatten all rings (each zone's outer, then its holes) in a fixed order.
+        let mut rings: Vec<Vec<Pt>> = Vec::new();
+        for z in &self.zones {
+            rings.push(z.outer.clone());
+            for h in &z.holes {
+                rings.push(h.clone());
+            }
+        }
+
+        let (arcs_full, ring_refs) = topology::build(&rings);
+        let mut arcs: Vec<Vec<Pt>> = if vw >= 1.0 {
+            arcs_full.clone()
+        } else {
+            arcs_full.iter().map(|a| topology::vw_simplify(a, vw)).collect()
+        };
+
+        // Map flat ring indices back to (zone, outer|hole).
+        let mut flat = 0usize;
+        let mut zone_outer: Vec<usize> = Vec::with_capacity(self.zones.len());
+        let mut zone_holes: Vec<Vec<usize>> = Vec::with_capacity(self.zones.len());
+        for z in &self.zones {
+            zone_outer.push(flat);
+            flat += 1;
+            let mut hs = Vec::with_capacity(z.holes.len());
+            for _ in &z.holes {
+                hs.push(flat);
+                flat += 1;
+            }
+            zone_holes.push(hs);
+        }
+
+        // Lossy simplification can collapse an outer ring below 3 vertices; if so,
+        // restore (to full resolution) the arcs it uses and retry, so the stored
+        // arcs always rebuild to a valid ring.  Monotonic → terminates.
+        loop {
+            let mut changed = false;
+            for oi in &zone_outer {
+                if topology::reconstruct(&arcs, &ring_refs[*oi]).len() < 3 {
+                    for r in &ring_refs[*oi] {
+                        if arcs[r.arc].len() < arcs_full[r.arc].len() {
+                            arcs[r.arc] = arcs_full[r.arc].clone();
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Rebuild each zone from the (possibly restored) arcs.  Degenerate holes
+        // (< 3 vertices after simplification) are dropped — a reader rebuilding
+        // from the same arcs drops them identically.
+        for (zi, z) in self.zones.iter_mut().enumerate() {
+            let outer_refs = ring_refs[zone_outer[zi]].clone();
+            z.outer = topology::reconstruct(&arcs, &outer_refs);
+            z.outer_refs = outer_refs;
+
+            let mut holes = Vec::new();
+            let mut hole_aabbs = Vec::new();
+            let mut hole_refs = Vec::new();
+            for &hi in &zone_holes[zi] {
+                let refs = ring_refs[hi].clone();
+                let hole = topology::reconstruct(&arcs, &refs);
+                if hole.len() >= 3 {
+                    hole_aabbs.push(geom::poly_aabb(&hole));
+                    holes.push(hole);
+                    hole_refs.push(refs);
+                }
+            }
+            z.holes = holes;
+            z.hole_aabbs = hole_aabbs;
+            z.hole_refs = hole_refs;
+            z.aabb = geom::poly_aabb(&z.outer);
+            z.a = geom::ring_area2(&z.outer).abs();
+        }
+
+        let arc_verts = arcs.iter().map(|a| a.len()).sum();
+        self.arcs = arcs;
+        (self.arcs.len(), arc_verts)
     }
 
     /// Subdivide the flat root into a quadtree driven by the cost model (see
@@ -248,19 +346,10 @@ impl Output {
         }
     }
 
-    /// Pack every zone's geometry into origin + base64 delta stream.
+    /// Pack every shared arc into origin + delta stream (the serializers add
+    /// base64 or store raw as needed).
     pub fn pack(&mut self) {
-        for zone in &mut self.zones {
-            let (o, p) = polycodec::encode_polygon(&zone.outer);
-            zone.o = o;
-            zone.p = polycodec::base64_encode(&p);
-            let mut packed_holes = Vec::with_capacity(zone.holes.len());
-            for hole in &zone.holes {
-                let (ho, hp) = polycodec::encode_polygon(hole);
-                packed_holes.push((ho, polycodec::base64_encode(&hp)));
-            }
-            zone.h = packed_holes;
-        }
+        self.arc_packed = self.arcs.iter().map(|arc| polycodec::encode_polygon(arc)).collect();
     }
 
     /// Tree + cost statistics.  Cost fields require `refz` to still be populated,

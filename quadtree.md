@@ -42,7 +42,8 @@ compiled-in values.
   "quant":    { ... },   // quantization parameters (§3)
   "rootCell": [ ... ],   // bounds of the whole world (§4)
   "quadtree": { ... },   // the spatial index (§5)
-  "zones":    [ ... ],   // polygon records, indexed by zone id (§6)
+  "arcs":     [ ... ],   // shared polygon boundary arcs (§6)
+  "zones":    [ ... ],   // polygon records (reference arcs), indexed by zone id (§6)
   "tz":       { ... }    // timezone records, keyed by tzid name (§7)
 }
 ```
@@ -256,19 +257,36 @@ winding-number point-in-polygon test — the answer is identical.
 
 ---
 
-## 6. `zones`
+## 6. `arcs` and `zones`
 
-An array of polygon records, indexed by **zone id** (`zones[id].id == id`).
+Adjacent zones share ~80% of their boundary edges (the border between two
+timezones is one line, not two). The geometry is therefore stored **once** as a
+set of shared **arcs** (the TopoJSON model), and each zone references the arcs
+that make up its rings rather than repeating the vertices.
+
+### 6.0 `arcs`
+
+An array of shared boundary polylines, indexed by **arc id** (the array index).
+Each arc is stored exactly like a ring used to be — an origin `o` plus a base64
+packed delta stream `p` (§6.1) — decoding to a list of absolute vertices:
+
+```jsonc
+{ "o": [-25054, 18948], "p": "1OzNEIKX8t3W…" }
+```
+
+### 6.1a `zones`
+
+An array of polygon records, indexed by **zone id** (`zones[id].id == id`). A
+ring is a list of **signed arc references** instead of vertices:
 
 ```jsonc
 {
-  "id":   0,
-  "aabb": [[-25054, 12123], [-7261, 31283]],   // bounding box, quantized units
-  "a":    463079127,                            // area (unsigned, doubled) — tie-break key
-  "tzid": 0,                                    // which timezone (index into `tz`)
-  "o":    [-25054, 18948],                       // origin: absolute coords of vertex 0
-  "p":    "1OzNEIKX8t3W…",                        // base64 packed delta stream (outer ring)
-  "h":    [ { "o": [...], "p": "..." }, ... ]     // OPTIONAL: holes, same o/p encoding
+  "id":    0,
+  "aabb":  [[-25054, 12123], [-7261, 31283]],  // bounding box, quantized units
+  "a":     463079127,                           // area (unsigned, doubled) — tie-break key
+  "tzid":  0,                                   // which timezone (index into `tz`)
+  "outer": [ 12, -6, 40 ],                      // outer ring: arc refs (see below)
+  "h":     [ [ 41, -13 ], ... ]                 // OPTIONAL: holes, each a list of arc refs
 }
 ```
 
@@ -278,17 +296,23 @@ An array of polygon records, indexed by **zone id** (`zones[id].id == id`).
 | `aabb` | axis-aligned bounding box `[[xLo,yLo],[xHi,yHi]]` in quantized units; a cheap reject before decoding |
 | `a` | unsigned doubled polygon area of the outer ring, in quantized units²; used only as the smallest-wins tie-break (§5.2) |
 | `tzid` | the timezone this polygon belongs to — an index into the `tz` records (`tz[name].id`) |
-| `o` | **origin**: the absolute quantized `[x, y]` of the ring's first vertex |
-| `p` | base64 of the packed delta stream for the outer ring (§6.1) |
-| `h` | present only if the polygon has holes; each is `{o, p}` encoding one interior ring the same way |
+| `outer` | the outer ring as a list of **arc references**: `i` means `arcs[i]` forwards, `-i-1` means `arcs[i]` reversed |
+| `h` | present only if the polygon has holes; each hole is its own list of arc references |
+
+**Rebuilding a ring.** Concatenate the referenced arcs in order (reversing an
+arc's vertices when its ref is negative), dropping the vertex each arc shares
+with the previous one, then drop the final vertex (the closure back to the
+start). Reference: `tzlookup.reconstructRing` (JS) / `topology::reconstruct`
+(Rust). Because a shared arc is simplified once, both zones that use it stay
+seam-consistent.
 
 Zones with holes carry `h`; the sample dataset has zones with up to 11 holes.
 Holes are the interior boundaries (lakes, enclaves) subtracted from the outer
 ring.
 
-### 6.1 Decoding `o` + `p` into vertices
+### 6.1 Decoding an arc's `o` + `p` into vertices
 
-A ring is stored as an explicit integer **origin** (`o`) plus a **delta stream**
+An arc is stored as an explicit integer **origin** (`o`) plus a **delta stream**
 (`p`): base64 → bytes → a sequence of signed `(dx, dy)` deltas between
 consecutive vertices. Reconstruct absolute vertices by running sum:
 

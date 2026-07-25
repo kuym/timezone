@@ -4,7 +4,9 @@
 
 use super::Serializer;
 use crate::build::{Cand, Node, Output, Zone};
+use crate::polycodec;
 use crate::quant;
+use crate::topology::ArcRef;
 
 pub struct JsonSerializer;
 
@@ -30,6 +32,18 @@ impl Serializer for JsonSerializer {
         s.push_str("\"quadtree\":");
         write_node(&mut s, out, out.root);
         s.push(',');
+
+        // arcs (shared polygon boundaries) — origin + base64 delta stream each
+        s.push_str("\"arcs\":[");
+        for (i, (o, p)) in out.arc_packed.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{{\"o\":[{},{}],\"p\":", o[0], o[1]));
+            s.push_str(&json_str(&polycodec::base64_encode(p)));
+            s.push('}');
+        }
+        s.push_str("],");
 
         // zones
         s.push_str("\"zones\":[");
@@ -147,25 +161,36 @@ fn write_runs(s: &mut String, runs: &[(u32, u32)]) {
     s.push(']');
 }
 
-// Zone key order: id, aabb, a, tzid, o, p, h.
+// Zone key order: id, aabb, a, tzid, outer (arc refs), h (hole arc refs).
+// An arc reference is a signed integer: i for arc i forward, -i-1 reversed.
 fn write_zone(s: &mut String, z: &Zone) {
     s.push_str(&format!("{{\"id\":{},\"aabb\":[[{},{}],[{},{}]],\"a\":{},\"tzid\":{},",
         z.id, z.aabb[0][0], z.aabb[0][1], z.aabb[1][0], z.aabb[1][1], z.a, z.tzid));
-    s.push_str(&format!("\"o\":[{},{}],\"p\":", z.o[0], z.o[1]));
-    s.push_str(&json_str(&z.p));
-    if !z.h.is_empty() {
+    s.push_str("\"outer\":");
+    write_arc_refs(s, &z.outer_refs);
+    if !z.hole_refs.is_empty() {
         s.push_str(",\"h\":[");
-        for (i, (ho, hp)) in z.h.iter().enumerate() {
+        for (i, refs) in z.hole_refs.iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
-            s.push_str(&format!("{{\"o\":[{},{}],\"p\":", ho[0], ho[1]));
-            s.push_str(&json_str(hp));
-            s.push('}');
+            write_arc_refs(s, refs);
         }
         s.push(']');
     }
     s.push('}');
+}
+
+fn write_arc_refs(s: &mut String, refs: &[ArcRef]) {
+    s.push('[');
+    for (i, r) in refs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let v: i64 = if r.rev { -(r.arc as i64) - 1 } else { r.arc as i64 };
+        s.push_str(&v.to_string());
+    }
+    s.push(']');
 }
 
 // Shortest round-trippable f64 text (matches JS Number->string for these values).
