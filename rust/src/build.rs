@@ -10,9 +10,17 @@ use crate::polycodec;
 use crate::quant::{MAX_DEPTH, ROOT_CELL};
 use crate::topology::{self, ArcRef};
 
-// Lookup cost model: 1 op per quadtree level descended, 2 ops per ring edge
-// evaluated in the point-in-polygon test.
+// Lookup cost model:
+//   1 op per quadtree level descended;
+//   1 op per arc vertex decoded to rebuild the candidate rings the localized test
+//     needs (a reader decodes the whole of every arc that crosses the cell —
+//     shared-arc geometry cannot be decoded partway);
+//   2 ops per ring edge evaluated in the localized point-in-polygon test.
+// Counting only the arcs that cross the cell (not a candidate's whole ring) keeps
+// the cost subdivision-reducible: a smaller cell is crossed by fewer arcs, so
+// `--max-ops` can actually drive it down.
 pub const TRAVERSAL_OP: i64 = 1;
+pub const RECON_OP: i64 = 1;
 pub const VERTEX_OP: i64 = 2;
 
 /// How a zone relates to a cell.
@@ -47,19 +55,28 @@ pub struct Tz {
     pub refs: Vec<usize>,
 }
 
+/// The edges of ONE arc that cross a leaf cell: `a` indexes the ring's arc-ref
+/// list (`zone.outer_refs`, or `zone.hole_refs[i]`), and `runs` are inclusive
+/// `[first, last]` local edge ranges within that arc, in ring orientation.  A
+/// reader decodes only the arcs named here, not the candidate's whole ring.
+pub struct ArcRun {
+    pub a: u32,
+    pub runs: Vec<(u32, u32)>,
+}
+
 /// Per-leaf localization for one hole of a candidate.
 pub struct HoleCand {
     pub i: usize,
     pub w: i64,
-    pub e: Vec<(u32, u32)>,
+    pub e: Vec<ArcRun>,
 }
 
 /// A leaf candidate: which zone, the winding of the cell centre w.r.t. its full
-/// outer ring, and the outer edge runs (plus crossing holes) in this cell.
+/// outer ring, and the crossing arcs (plus crossing holes) in this cell.
 pub struct Cand {
     pub z: usize,
     pub w: i64,
-    pub e: Vec<(u32, u32)>,
+    pub e: Vec<ArcRun>,
     pub h: Vec<HoleCand>,
 }
 
@@ -105,6 +122,7 @@ pub struct Stats {
     pub max_depth: usize,
     pub max_leaf_refs: usize,
     pub max_leaf_cost: i64,
+    pub max_leaf_true_cost: i64,
     pub leaves_over_limit: Option<usize>,
 }
 
@@ -252,7 +270,7 @@ impl Output {
     /// takes precedence) runs out.
     pub fn subdivide(&mut self, op_limit: i64, max_splits: Option<usize>) -> SubStats {
         let mut heap = JsHeap::new();
-        let root_cost = leaf_cost(&self.arena[self.root].refz, &self.zones, &ROOT_CELL, 0);
+        let root_cost = leaf_cost(&self.arena[self.root].refz, &self.zones, &self.arcs, &ROOT_CELL, 0);
         heap.push(Entry { cost: root_cost, idx: self.root, cell: ROOT_CELL, depth: 0 });
 
         let (mut splits, mut at_max_depth, mut over_limit) = (0usize, 0usize, 0usize);
@@ -290,7 +308,7 @@ impl Output {
                         Rel::Disjoint => {}
                     }
                 }
-                let cost = leaf_cost(&child.refz, &self.zones, &cc, leaf.depth + 1);
+                let cost = leaf_cost(&child.refz, &self.zones, &self.arcs, &cc, leaf.depth + 1);
                 self.arena.push(child);
                 entries.push(Entry { cost, idx: base + i, cell: cc, depth: leaf.depth + 1 });
             }
@@ -327,14 +345,16 @@ impl Output {
             let mut cands = Vec::with_capacity(refz.len());
             for zi in refz {
                 let zone = &self.zones[zi];
-                let e = edge_runs(&zone.outer, &cell);
+                // Winding stays w.r.t. the FULL ring; only the crossing arcs are
+                // localized, so the reader rebuilds just those.
+                let e = arc_runs(&zone.outer_refs, &self.arcs, &cell);
                 let w = geom::poly_winding(&zone.outer, center);
                 let mut h = Vec::new();
                 for (hi, hole) in zone.holes.iter().enumerate() {
                     if !geom::aabbs_overlap(&cell, &zone.hole_aabbs[hi]) {
                         continue;
                     }
-                    let he = edge_runs(hole, &cell);
+                    let he = arc_runs(&zone.hole_refs[hi], &self.arcs, &cell);
                     if he.is_empty() {
                         continue;
                     }
@@ -357,6 +377,7 @@ impl Output {
     pub fn tree_stats(&self, op_limit: Option<i64>) -> Stats {
         let (mut nodes, mut leaves, mut refs, mut erefs) = (0usize, 0usize, 0usize, 0usize);
         let (mut max_depth, mut max_leaf_refs, mut max_cost, mut over) = (0usize, 0usize, 0i64, 0usize);
+        let mut max_true_cost = 0i64;
         let mut stack: Vec<(usize, Aabb, usize)> = vec![(self.root, ROOT_CELL, 0)];
         while let Some((idx, cell, d)) = stack.pop() {
             nodes += 1;
@@ -373,8 +394,9 @@ impl Output {
                 None => {
                     leaves += 1;
                     max_leaf_refs = max_leaf_refs.max(node.refz.len());
-                    let cost = leaf_cost(&node.refz, &self.zones, &cell, d);
+                    let cost = leaf_cost(&node.refz, &self.zones, &self.arcs, &cell, d);
                     max_cost = max_cost.max(cost);
+                    max_true_cost = max_true_cost.max(leaf_true_cost(&node.refz, &self.zones, &self.arcs, &cell, d));
                     if let Some(limit) = op_limit {
                         if cost > limit {
                             over += 1;
@@ -391,6 +413,7 @@ impl Output {
             max_depth,
             max_leaf_refs,
             max_leaf_cost: max_cost,
+            max_leaf_true_cost: max_true_cost,
             leaves_over_limit: op_limit.map(|_| over),
         }
     }
@@ -433,7 +456,8 @@ impl Output {
 
     fn local_contains(&self, cand: &Cand, center: Pt, point: Pt) -> bool {
         let zone = &self.zones[cand.z];
-        match segment_crossings(center, point, &zone.outer, &cand.e) {
+        // Sum ray crossings over just the crossing arcs of the outer ring.
+        match arc_crossings(&cand.e, &zone.outer_refs, &self.arcs, center, point) {
             None => return geom::rings_contain_point(&zone.outer, &zone.holes, point),
             Some(d) => {
                 if cand.w + d == 0 {
@@ -442,8 +466,7 @@ impl Output {
             }
         }
         for hc in &cand.h {
-            let hole = &zone.holes[hc.i];
-            match segment_crossings(center, point, hole, &hc.e) {
+            match arc_crossings(&hc.e, &zone.hole_refs[hc.i], &self.arcs, center, point) {
                 None => return geom::rings_contain_point(&zone.outer, &zone.holes, point),
                 Some(d) => {
                     if hc.w + d != 0 {
@@ -522,37 +545,87 @@ pub fn classify(cell: &Aabb, zone: &Zone) -> Rel {
     }
 }
 
-fn count_edges_in_cell(ring: &[Pt], cell: &Aabb) -> usize {
-    let n = ring.len();
-    (0..n).filter(|&i| geom::edge_touches_aabb(cell, ring[i], ring[(i + 1) % n])).count()
+// Edges of one arc (an open polyline, not a closed ring) that cross the cell.
+fn arc_edges_in_cell(arc: &[Pt], cell: &Aabb) -> usize {
+    (0..arc.len().saturating_sub(1)).filter(|&i| geom::edge_touches_aabb(cell, arc[i], arc[i + 1])).count()
 }
 
-/// Vertex comparisons a lookup performs for one candidate in one cell.
-pub fn localized_edge_count(zone: &Zone, cell: &Aabb) -> usize {
-    let mut n = count_edges_in_cell(&zone.outer, cell);
-    for (hi, hole) in zone.holes.iter().enumerate() {
-        if geom::aabbs_overlap(cell, &zone.hole_aabbs[hi]) {
-            n += count_edges_in_cell(hole, cell);
+/// Cost of testing one candidate zone in one cell, as (arc vertices a reader
+/// decodes, ring edges it then evaluates).  With arc-localized candidates a
+/// reader rebuilds only the arcs that cross the cell — so this counts the full
+/// vertex length of each crossing arc, and the localized edges within them.
+pub fn candidate_cost(zone: &Zone, cell: &Aabb, arcs: &[Vec<Pt>]) -> (i64, i64) {
+    let (mut recon, mut edges) = (0i64, 0i64);
+    let mut acc = |r: &ArcRef| {
+        let c = arc_edges_in_cell(&arcs[r.arc], cell);
+        if c > 0 {
+            recon += arcs[r.arc].len() as i64;
+            edges += c as i64;
+        }
+    };
+    for r in &zone.outer_refs {
+        acc(r);
+    }
+    for (hi, hrefs) in zone.hole_refs.iter().enumerate() {
+        if !geom::aabbs_overlap(cell, &zone.hole_aabbs[hi]) {
+            continue;
+        }
+        for r in hrefs {
+            acc(r);
         }
     }
-    n
+    (recon, edges)
 }
 
-/// Worst-case lookup cost, in ops, for a leaf holding `refz` at `cell`/`depth`.
-pub fn leaf_cost(refz: &[usize], zones: &[Zone], cell: &Aabb, depth: usize) -> i64 {
-    let mut edges = 0usize;
+/// The **subdivision-reducible** lookup cost of a leaf: traversal + the localized
+/// point-in-polygon edge tests.  This is what `--max-ops` governs, because it is
+/// what splitting a cell can actually lower.  Arc reconstruction is excluded —
+/// even localized to crossing arcs it has an irreducible floor (a single long arc
+/// crossing a cell must be decoded in full no matter how small the cell), so
+/// counting it here would make the budget unsatisfiable and split uselessly to
+/// MAX_DEPTH.  See `leaf_true_cost` for the full cost a reader actually pays.
+pub fn leaf_cost(refz: &[usize], zones: &[Zone], arcs: &[Vec<Pt>], cell: &Aabb, depth: usize) -> i64 {
+    let mut edges = 0i64;
     for &zi in refz {
-        edges += localized_edge_count(&zones[zi], cell);
+        edges += candidate_cost(&zones[zi], cell, arcs).1;
     }
-    depth as i64 * TRAVERSAL_OP + edges as i64 * VERTEX_OP
+    depth as i64 * TRAVERSAL_OP + edges * VERTEX_OP
 }
 
-// Compress edge indices intersecting `cell` into inclusive [first, last] runs.
-fn edge_runs(ring: &[Pt], cell: &Aabb) -> Vec<(u32, u32)> {
+/// The full worst-case lookup cost a reader pays for this leaf, INCLUDING arc
+/// reconstruction — the same accounting `tzlookup_binary.js` reports.  Now that
+/// readers rebuild only the crossing arcs, this counts just those arcs' vertices
+/// (not the whole ring), so it is far lower than before.  Reported, not used to
+/// drive subdivision (see `leaf_cost`); `--vw` is the lever that lowers it.
+pub fn leaf_true_cost(refz: &[usize], zones: &[Zone], arcs: &[Vec<Pt>], cell: &Aabb, depth: usize) -> i64 {
+    let mut cost = depth as i64 * TRAVERSAL_OP;
+    for &zi in refz {
+        let (recon, edges) = candidate_cost(&zones[zi], cell, arcs);
+        cost += recon * RECON_OP + edges * VERTEX_OP;
+    }
+    cost
+}
+
+// For a ring (its arc-ref list), the arcs that cross `cell`, each with the local
+// edge runs (in ring orientation) that cross.  Only these arcs need decoding.
+fn arc_runs(refs: &[ArcRef], arcs: &[Vec<Pt>], cell: &Aabb) -> Vec<ArcRun> {
+    let mut out = Vec::new();
+    for (ai, r) in refs.iter().enumerate() {
+        let runs = arc_edge_runs(&arcs[r.arc], r.rev, cell);
+        if !runs.is_empty() {
+            out.push(ArcRun { a: ai as u32, runs });
+        }
+    }
+    out
+}
+
+// Edge indices of one arc (open polyline, oriented as it appears in the ring —
+// reversed when `rev`) that cross `cell`, as inclusive [first, last] runs.
+fn arc_edge_runs(arc: &[Pt], rev: bool, cell: &Aabb) -> Vec<(u32, u32)> {
+    let ring_arc: Vec<Pt> = if rev { arc.iter().rev().cloned().collect() } else { arc.to_vec() };
     let mut runs: Vec<(u32, u32)> = Vec::new();
-    let n = ring.len();
-    for i in 0..n {
-        if geom::edge_touches_aabb(cell, ring[i], ring[(i + 1) % n]) {
+    for i in 0..ring_arc.len().saturating_sub(1) {
+        if geom::edge_touches_aabb(cell, ring_arc[i], ring_arc[i + 1]) {
             let iu = i as u32;
             if let Some(last) = runs.last_mut() {
                 if last.1 + 1 == iu {
@@ -564,6 +637,32 @@ fn edge_runs(ring: &[Pt], cell: &Aabb) -> Vec<(u32, u32)> {
         }
     }
     runs
+}
+
+// One arc's vertices as they appear in the ring (reversed when `rev`).
+fn ring_arc(arcs: &[Vec<Pt>], r: &ArcRef) -> Vec<Pt> {
+    if r.rev {
+        arcs[r.arc].iter().rev().cloned().collect()
+    } else {
+        arcs[r.arc].clone()
+    }
+}
+
+// Sum of signed center->point ray crossings over a ring's localized arc runs
+// (decoding only those arcs), or None if any arc's test is degenerate.
+fn arc_crossings(
+    runs: &[ArcRun],
+    refs: &[ArcRef],
+    arcs: &[Vec<Pt>],
+    center: Pt,
+    point: Pt,
+) -> Option<i64> {
+    let mut total = 0i64;
+    for ar in runs {
+        let arc = ring_arc(arcs, &refs[ar.a as usize]);
+        total += segment_crossings(center, point, &arc, &ar.runs)?;
+    }
+    Some(total)
 }
 
 struct Entry {

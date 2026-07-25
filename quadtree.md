@@ -199,9 +199,9 @@ occur — see §5.2):
 {
   "z": 629,                       // zone id (index into `zones`)
   "w": 0,                         // winding number of the CELL CENTER vs the full outer ring
-  "e": [[8, 10], [17, 40]],       // outer-ring edge runs that intersect this cell
+  "e": [[3, [[8, 10]]], [5, [[0, 2]]]],  // crossing arcs: [arcIndex, [edge runs within it]]
   "h": [                          // OPTIONAL: only holes that cross this cell
-    { "i": 1, "w": 0, "e": [[8, 9]] }
+    { "i": 1, "w": 0, "e": [[0, [[8, 9]]]] }
   ]
 }
 ```
@@ -210,12 +210,14 @@ occur — see §5.2):
 |---|---|
 | `z` | zone id — index into `zones` |
 | `w` | signed winding number of this **cell's center** with respect to the zone's **full outer ring** (usually `0`, `+1`, or `-1`) |
-| `e` | list of `[firstEdge, lastEdge]` inclusive index runs into the outer ring; these are the edges that pass through this cell. Edge `i` connects outer vertex `i` to vertex `i+1` (mod n). May be empty `[]` if only a hole crosses the cell |
-| `h` | present only if one or more holes cross this cell; array of `{i, w, e}` where `i` is the hole index (into `zones[z].h` / the decoded holes), and `w`/`e` mirror the outer fields for that hole ring |
+| `e` | the **arcs of the outer ring that cross this cell**, each `[arcIndex, [[firstEdge, lastEdge], ...]]`: `arcIndex` indexes the ring's arc-ref list (`zones[z].outer`), and the runs are local edge indices *within that arc*, in ring orientation. A reader decodes **only these arcs**, not the whole ring. May be empty `[]` if only a hole crosses the cell |
+| `h` | present only if one or more holes cross this cell; array of `{i, w, e}` where `i` is the hole index (into `zones[z].h`), and `w`/`e` mirror the outer fields — `e` naming the crossing arcs of that hole ring |
 
 `w` and `e` together enable the **localized point-in-polygon test** (§5.2):
-storing only the local edges plus a precomputed winding number lets a lookup test
-a handful of edges instead of the whole (possibly thousands-of-vertices) ring.
+storing which arcs cross the cell (plus a precomputed winding number) lets a
+lookup decode and test only those arcs, instead of rebuilding the whole
+(possibly thousands-of-vertices) ring from its shared arcs. Edge `i` of an arc
+connects the arc's ring-oriented vertex `i` to vertex `i+1`.
 
 Holes that do **not** cross the cell are omitted from `h` — they cannot change
 the answer for any point inside the cell.

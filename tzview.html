@@ -32,6 +32,7 @@
 
 		let db = null;
 		let mat = null;
+		let arcs = null; // decoded shared boundary arcs (topology artifact)
 
 		// Forward transform from quantized units to canvas pixels.  Both axes use
 		// the same scale (the domain is 2:1, matching 360 x 180 degrees), so the
@@ -70,7 +71,7 @@
 			c2d.lineWidth = 1;
 			c2d.beginPath();
 			for (let i = 0; i < db.zones.length; i++) {
-				const rings = tzlookup.zoneRings(db.zones[i]);
+				const rings = tzlookup.zoneRings(db.zones[i], arcs);
 				tracePoly(c2d, rings.outer);
 				for (let j = 0; j < rings.holes.length; j++) {
 					tracePoly(c2d, rings.holes[j]);
@@ -123,7 +124,7 @@
 				drawPolygons(c2d);
 			}
 			if (highlight) {
-				const rings = tzlookup.zoneRings(highlight);
+				const rings = tzlookup.zoneRings(highlight, arcs);
 				c2d.fillStyle = "rgba(0, 90, 220, 0.35)";
 				c2d.strokeStyle = "rgba(0, 60, 180, 0.9)";
 				c2d.lineWidth = 1.5;
@@ -161,25 +162,35 @@
 			// tested against only the ring edges that cross this leaf cell.  Each
 			// name is annotated with (evaluated / full) ring vertices, showing how
 			// much the per-leaf localization saved for that candidate.
+			const arcLen = function(ref) { return arcs[ref < 0 ? -ref - 1 : ref].length; };
 			const cand = res.probe.candidates.map(function(c) {
 				const z = db.zones[c.z];
-				let evald = 0;
-				(c.e || []).forEach(function(r) { evald += r[1] - r[0] + 1; });
-				(c.h || []).forEach(function(h) {
-					(h.e || []).forEach(function(r) { evald += r[1] - r[0] + 1; });
+				let evald = 0, touched = 0;
+				(c.e || []).forEach(function(ar) {
+					touched += arcLen(z.outer[ar[0]]);
+					ar[1].forEach(function(r) { evald += r[1] - r[0] + 1; });
 				});
-				const rings = tzlookup.zoneRings(z);
+				(c.h || []).forEach(function(hc) {
+					(hc.e || []).forEach(function(ar) {
+						touched += arcLen(z.h[hc.i][ar[0]]);
+						ar[1].forEach(function(r) { evald += r[1] - r[0] + 1; });
+					});
+				});
+				const rings = tzlookup.zoneRings(z, arcs);
 				let full = rings.outer.length;
 				rings.holes.forEach(function(h) { full += h.length; });
-				return db.tzById[z.tzid].n + " (" + evald + "/" + full + " verts)";
+				// edges evaluated, and arc vertices actually decoded vs the full ring.
+				return db.tzById[z.tzid].n + " (" + evald + " edges, " + touched + "/" + full + " arc verts)";
 			});
 
-			// Cost to resolve this point: the quadtree descent is `depth` levels,
-			// each a pair of coordinate comparisons; the leaf work is the number of
-			// polygon vertices actually evaluated in the point-in-polygon tests.
+			// Cost to resolve this point, matching tzlookup_binary.js's accounting:
+			//   1 op per quadtree level descended;
+			//   1 op per arc vertex decoded to rebuild each candidate's ring from
+			//     the shared arcs (usually the dominant cost with topology geometry);
+			//   2 ops per ring edge evaluated in the localized point-in-polygon test.
 			const s = res.stats;
-			const descentComparisons = s.depth * 2;
-			const total = descentComparisons + s.vertices;
+			const recon = s.reconVertices || 0;
+			const total = s.depth + recon + 2 * s.vertices;
 
 			document.getElementById("readout").innerHTML =
 				'<span class="tz ' + cls + '">' + label + '</span>' +
@@ -194,8 +205,8 @@
 				'definitive (eref): ' + res.probe.definite.length +
 				'   candidates (ref): ' + res.probe.candidates.length +
 				(cand.length ? '  -> ' + cand.join(", ") : '') + '\n' +
-				'<b>cost</b>: descent ' + s.depth + ' levels (' + descentComparisons +
-				' comparisons) + leaf ' + s.vertices + ' vertices evaluated' +
+				'<b>cost</b>: descent ' + s.depth + ' + ring reconstruction ' + recon +
+				' arc verts + localized test ' + (2 * s.vertices) + ' (' + s.vertices + ' edges)' +
 				(s.fallbacks ? ' (' + s.fallbacks + ' full-ring fallback)' : '') +
 				'  =  ' + total + ' ops';
 
@@ -210,6 +221,10 @@
 			})
 			.then(function(data) {
 				db = data;
+				// Decode the shared boundary arcs once (topology artifact); older
+				// artifacts without `arcs` decode to [] and zoneRings falls back to
+				// the per-zone o/p packing.
+				arcs = tzlookup.decodeArcs(db);
 				// Index timezones by numeric id for the readout.
 				db.tzById = {};
 				for (const name in db.tz) { db.tzById[db.tz[name].id] = db.tz[name]; }

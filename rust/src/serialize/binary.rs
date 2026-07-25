@@ -32,11 +32,13 @@
 //!             if internal: child0 child1 child2 child3   (each a node)
 //!             else (leaf): refCount × candidate           (sorted by rank, z delta-coded)  [P4/P5]
 //!     candidate := zDelta:q                     (rank delta from the previous candidate)   [P4/P5]
-//!                  packed:q                     ((runCount<<3)|(windCode<<1)|hasHoles)      [P1]
+//!                  packed:q                     ((outerArcCount<<3)|(windCode<<1)|hasHoles) [P1]
 //!                  [ w:zigzag-q ]  if windCode == 3   (escape for |w| > 1)
-//!                  runCount × ( gap:q, len:q )        (run count comes from `packed`)
-//!                  [ holeCount:q, holeCount × ( i:q, w:zigzag-q, runsWithCount ) ] if hasHoles
-//!     runsWithCount := count:q, count × ( gap:q, len:q )
+//!                  outerArcCount × arcRuns            (the outer arcs crossing this cell)
+//!                  [ holeCount:q, holeCount × ( i:q, w:zigzag-q, arcCount:q, arcCount × arcRuns ) ]
+//!     arcRuns := arcIdxDelta:q, runCount:q, runCount × ( gap:q, len:q )
+//!         arcIdxDelta indexes the ring's arc-ref list; a reader decodes ONLY these
+//!         crossing arcs (not the candidate's whole ring) to run the localized test.
 //!   section 2 — arcs (`arcs` count entries — the shared polygon boundaries):
 //!     arc := ox:coord, oy:coord, pLen:uintLE, p:bytes   (polycodec packed, no base64)
 //!   section 3 — zones (`zones` count entries, in rank order):
@@ -60,7 +62,7 @@
 
 use super::qvarint::{read_q, representable, unzigzag, write_q, zigzag, Q_MAX};
 use super::Serializer;
-use crate::build::{Cand, Output};
+use crate::build::{ArcRun, Cand, Output};
 use crate::quant;
 use crate::topology::ArcRef;
 
@@ -224,7 +226,7 @@ fn encode_node(out: &Output, idx: usize, buf: &mut Vec<u8>, remap: &[u32]) -> Re
     Ok(())
 }
 
-// P1: winding, run count and hole presence share one `q`.
+// P1: winding, outer arc count and hole presence share one `q`.
 fn encode_candidate_meta(cand: &Cand, buf: &mut Vec<u8>) {
     let wind_code: u64 = match cand.w {
         0 => 0,
@@ -238,15 +240,27 @@ fn encode_candidate_meta(cand: &Cand, buf: &mut Vec<u8>) {
     if wind_code == 3 {
         write_q(buf, zigzag(cand.w));
     }
-    encode_runs(&cand.e, buf); // count is carried by `packed`, so no length here
+    encode_arc_runs(&cand.e, buf); // outer crossing arcs (count carried by `packed`)
     if has_holes {
         write_q(buf, cand.h.len() as u64);
         for h in &cand.h {
             write_q(buf, h.i as u64);
             write_q(buf, zigzag(h.w));
-            write_q(buf, h.e.len() as u64); // holes keep their own run count
-            encode_runs(&h.e, buf);
+            write_q(buf, h.e.len() as u64); // hole crossing-arc count
+            encode_arc_runs(&h.e, buf);
         }
+    }
+}
+
+// Each crossing arc: arcIndex (delta from previous, sorted ascending), then its
+// local edge run count and runs.
+fn encode_arc_runs(e: &[ArcRun], buf: &mut Vec<u8>) {
+    let mut prev = 0u32;
+    for ar in e {
+        write_q(buf, (ar.a - prev) as u64);
+        prev = ar.a;
+        write_q(buf, ar.runs.len() as u64);
+        encode_runs(&ar.runs, buf);
     }
 }
 
@@ -274,12 +288,15 @@ enum DecKind {
     Leaf(Vec<DecCand>),
 }
 
+// e / hole-e are lists of (arcIndex, localRuns) — the crossing arcs.
+type DecArcRuns = Vec<(u64, Vec<(u64, u64)>)>;
+
 #[derive(PartialEq, Debug)]
 struct DecCand {
     z: u64,
     w: i64,
-    e: Vec<(u64, u64)>,
-    h: Vec<(u64, i64, Vec<(u64, u64)>)>,
+    e: DecArcRuns,
+    h: Vec<(u64, i64, DecArcRuns)>,
 }
 
 fn decode_node(bytes: &[u8], pos: &mut usize) -> DecNode {
@@ -323,12 +340,9 @@ fn decode_node(bytes: &[u8], pos: &mut usize) -> DecNode {
     DecNode { eref, kind }
 }
 
-fn decode_candidate_meta(
-    bytes: &[u8],
-    pos: &mut usize,
-) -> (i64, Vec<(u64, u64)>, Vec<(u64, i64, Vec<(u64, u64)>)>) {
+fn decode_candidate_meta(bytes: &[u8], pos: &mut usize) -> (i64, DecArcRuns, Vec<(u64, i64, DecArcRuns)>) {
     let packed = read_q(bytes, pos);
-    let run_count = packed >> 3;
+    let arc_count = packed >> 3;
     let wind_code = (packed >> 1) & 3;
     let has_holes = packed & 1 != 0;
 
@@ -338,7 +352,7 @@ fn decode_candidate_meta(
         2 => 1,
         _ => unzigzag(read_q(bytes, pos)),
     };
-    let e = decode_runs(bytes, pos, run_count);
+    let e = decode_arc_runs(bytes, pos, arc_count);
 
     let mut h = Vec::new();
     if has_holes {
@@ -346,12 +360,23 @@ fn decode_candidate_meta(
         for _ in 0..hn {
             let i = read_q(bytes, pos);
             let hw = unzigzag(read_q(bytes, pos));
-            let hc = read_q(bytes, pos);
-            let he = decode_runs(bytes, pos, hc);
-            h.push((i, hw, he));
+            let hac = read_q(bytes, pos);
+            h.push((i, hw, decode_arc_runs(bytes, pos, hac)));
         }
     }
     (w, e, h)
+}
+
+// arcCount crossing arcs: each an arcIndex (delta-decoded) then its local runs.
+fn decode_arc_runs(bytes: &[u8], pos: &mut usize, arc_count: u64) -> DecArcRuns {
+    let mut out = Vec::with_capacity(arc_count as usize);
+    let mut cum = 0u64;
+    for _ in 0..arc_count {
+        cum += read_q(bytes, pos);
+        let rc = read_q(bytes, pos);
+        out.push((cum, decode_runs(bytes, pos, rc)));
+    }
+    out
 }
 
 fn decode_runs(bytes: &[u8], pos: &mut usize, count: u64) -> Vec<(u64, u64)> {
@@ -364,6 +389,12 @@ fn decode_runs(bytes: &[u8], pos: &mut usize, count: u64) -> Vec<(u64, u64)> {
         prev = last + 1;
     }
     runs
+}
+
+fn arc_runs_to_dec(e: &[ArcRun]) -> DecArcRuns {
+    e.iter()
+        .map(|ar| (ar.a as u64, ar.runs.iter().map(|&(a, b)| (a as u64, b as u64)).collect()))
+        .collect()
 }
 
 fn arena_to_dec(out: &Output, idx: usize, remap: &[u32]) -> DecNode {
@@ -379,14 +410,8 @@ fn arena_to_dec(out: &Output, idx: usize, remap: &[u32]) -> DecNode {
             .map(|c| DecCand {
                 z: remap[c.z] as u64,
                 w: c.w,
-                e: c.e.iter().map(|&(a, b)| (a as u64, b as u64)).collect(),
-                h: c
-                    .h
-                    .iter()
-                    .map(|h| {
-                        (h.i as u64, h.w, h.e.iter().map(|&(a, b)| (a as u64, b as u64)).collect())
-                    })
-                    .collect(),
+                e: arc_runs_to_dec(&c.e),
+                h: c.h.iter().map(|h| (h.i as u64, h.w, arc_runs_to_dec(&h.e))).collect(),
             })
             .collect();
         cands.sort_by_key(|c| c.z);

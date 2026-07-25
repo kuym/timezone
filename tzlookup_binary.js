@@ -87,21 +87,34 @@
     return runs;
   }
 
+  // Each crossing arc: arcIndex (delta from previous) then local edge run count +
+  // runs.  Returns [[arcIndex, [[first,last],...]], ...] as tzlookup expects.
+  function readArcRuns(c, arcCount) {
+    const out = new Array(arcCount);
+    let cum = 0;
+    for (let i = 0; i < arcCount; i++) {
+      cum += c.q();
+      const rc = c.q();
+      out[i] = [cum, readRuns(c, rc)];
+    }
+    return out;
+  }
+
   function parseCandidate(c) {
     const packed = c.q();
-    const runCount = packed >> 3;
+    const arcCount = packed >> 3;
     const windCode = (packed >> 1) & 3;
     const hasHoles = packed & 1;
     const w = windCode === 0 ? 0 : windCode === 1 ? -1 : windCode === 2 ? 1 : unzigzag(c.q());
-    const e = readRuns(c, runCount);
+    const e = readArcRuns(c, arcCount);
     const h = [];
     if (hasHoles) {
       const hc = c.q();
       for (let i = 0; i < hc; i++) {
         const hi = c.q();
         const hw = unzigzag(c.q());
-        const hrc = c.q();
-        h.push({ i: hi, w: hw, e: readRuns(c, hrc) });
+        const hac = c.q();
+        h.push({ i: hi, w: hw, e: readArcRuns(c, hac) });
       }
     }
     return { w: w, e: e, h: h }; // `z` filled in by the caller
@@ -199,9 +212,18 @@
       const pLen = c.uintLE();
       this._arcMeta[i] = { o: [ox, oy], praw: c.take(pLen) };
     }
+    // A lazily-decoding view of the arcs: `arcs[i]` decodes arc i on first access.
+    // Passed to tzlookup, so only the arcs a lookup actually touches are decoded.
+    const self = this;
+    this._arcView = new Proxy(this._arcs, {
+      get: function (t, k) {
+        return (typeof k === "string" && /^\d+$/.test(k)) ? self._arc(+k) : t[k];
+      }
+    });
 
     // section 3: zones (rank order) — metadata + arc references.  Record each
     // record's byte offset so a lookup can report the file position it reads.
+    // `outer`/`h` hold signed arc refs, matching the JSON schema tzlookup expects.
     this.zones = new Array(zoneCount);
     this.zoneOffset = new Array(zoneCount);
     for (let rank = 0; rank < zoneCount; rank++) {
@@ -210,13 +232,13 @@
       const area = c.uintLE();
       const xLo = c.coord(), yLo = c.coord();
       const w = c.uintLE(), h = c.uintLE();
-      const outerRefs = readArcRefs(c);
+      const outer = readArcRefs(c);
       const holeCount = c.q();
       const holeRefs = new Array(holeCount);
       for (let i = 0; i < holeCount; i++) { holeRefs[i] = readArcRefs(c); }
       this.zones[rank] = {
         tzid: tzid, a: area, aabb: [[xLo, yLo], [xLo + w, yLo + h]],
-        outerRefs: outerRefs, holeRefs: holeRefs,
+        outer: outer, h: holeRefs,
       };
     }
 
@@ -238,26 +260,15 @@
     return this._arcs[idx];
   };
 
-  // Rebuild a zone's outer/holes from its arc references (memoized on the record,
-  // so tzlookup's zoneRings picks them up from `.outer`/`.holes`).
-  BinaryReader.prototype._rings = function (zone) {
-    if (!zone.outer) {
-      const self = this;
-      const build = function (refs) {
-        refs.forEach(function (s) { self._arc(s < 0 ? -s - 1 : s); });
-        return tzlookup.reconstructRing(self._arcs, refs);
-      };
-      zone.outer = build(zone.outerRefs);
-      zone.holes = zone.holeRefs.map(build);
-    }
-  };
-
-  // The distinct arc byte offsets a lookup reads to rebuild a zone's rings.
-  BinaryReader.prototype._arcSeeks = function (zone) {
+  // The byte offsets of the arcs a candidate's localized test reads — only the
+  // arcs that cross the cell (named in `cand.e` / `cand.h`), not the whole ring.
+  BinaryReader.prototype._candArcSeeks = function (zone, cand) {
     const self = this, offs = [];
-    const add = function (s) { offs.push(self.arcOffset[s < 0 ? -s - 1 : s]); };
-    zone.outerRefs.forEach(add);
-    zone.holeRefs.forEach(function (r) { r.forEach(add); });
+    const g = function (s) { return s < 0 ? -s - 1 : s; };
+    cand.e.forEach(function (ar) { offs.push(self.arcOffset[g(zone.outer[ar[0]])]); });
+    (cand.h || []).forEach(function (hc) {
+      hc.e.forEach(function (ar) { offs.push(self.arcOffset[g(zone.h[hc.i][ar[0]])]); });
+    });
     return offs;
   };
 
@@ -278,7 +289,8 @@
     const point = [x, y];
 
     const hit = tzlookup.probe(this.quadtree, this.rootCell, point);
-    const stats = { depth: hit.path.length, candidates: hit.candidates.length, vertices: 0, fallbacks: 0 };
+    const stats = { depth: hit.path.length, candidates: hit.candidates.length,
+                    vertices: 0, reconVertices: 0, fallbacks: 0 };
 
     // Quadtree-descent seeks: the root, then at each level the chosen child and
     // the siblings a skip-based reader would read to reach it.
@@ -305,22 +317,27 @@
       const zone = this.zones[cand.z];
       seeks.push(this.zoneOffset[cand.z]); // the zone record (metadata + arc refs)
       zoneSeeks++;
-      const arcs = this._arcSeeks(zone); // then each referenced arc, to rebuild the ring
-      for (let a = 0; a < arcs.length; a++) { seeks.push(arcs[a]); }
-      arcSeeks += arcs.length;
-      this._rings(zone);
-      if (tzlookup.localContainsZone(zone, hit.cell, cand, point, stats, this._arcs)) {
+      const arcOffs = this._candArcSeeks(zone, cand); // only the crossing arcs
+      for (let a = 0; a < arcOffs.length; a++) { seeks.push(arcOffs[a]); }
+      arcSeeks += arcOffs.length;
+      // localContainsZone decodes only the crossing arcs (via the lazy view) and
+      // accumulates stats.reconVertices / stats.vertices.
+      if (tzlookup.localContainsZone(zone, hit.cell, cand, point, stats, this._arcView)) {
         if (best === null || zone.a < best.a) { best = zone; }
       }
     }
 
+    // Cost model: 1 op per quadtree level, 1 op per arc vertex decoded (only the
+    // arcs crossing the cell), and 2 ops per ring edge evaluated in the localized
+    // point-in-polygon test.
+    const ops = stats.depth + stats.reconVertices + 2 * stats.vertices;
     const definite = best !== null && hit.definite.length > 0 && hit.candidates.length === 0;
     return {
       tzid: best ? best.tzid : null,
       name: best ? this.tzNames[best.tzid] : null,
       x: x, y: y, definite: definite,
-      depth: stats.depth, candidates: stats.candidates, vertices: stats.vertices,
-      ops: stats.depth + 2 * stats.vertices,
+      depth: stats.depth, candidates: stats.candidates,
+      vertices: stats.vertices, reconVertices: stats.reconVertices, ops: ops,
       seeks: seeks, seekCount: seeks.length,
       treeSeeks: treeSeeks, zoneSeeks: zoneSeeks, arcSeeks: arcSeeks,
     };
@@ -368,8 +385,10 @@ if (typeof require !== "undefined" && typeof module !== "undefined" && require.m
       (r.name === null ? "(no timezone)" : r.name) +
       (r.tzid === null ? "" : "  [tzid " + r.tzid + "]"));
     console.log("  " + (r.definite ? "resolved from eref (no polygon test)" : "resolved by point-in-polygon") +
-      "   depth " + r.depth + "   candidates tested " + r.candidates +
-      "   vertices evaluated " + r.vertices + "   ~" + r.ops + " ops");
+      "   depth " + r.depth + "   candidates tested " + r.candidates);
+    console.log("  ring reconstruction: " + r.reconVertices + " arc vertices decoded" +
+      "   localized test: " + r.vertices + " edges" +
+      "   ~" + r.ops + " ops (" + r.depth + " + " + r.reconVertices + " + 2×" + r.vertices + ")");
     console.log("  seeks performed: " + r.seekCount +
       " (" + r.treeSeeks + " quadtree-descent + " + r.zoneSeeks + " zone-record + " + r.arcSeeks + " arc)");
     console.log("  seek byte offsets: [" + r.seeks.join(", ") + "]\n");

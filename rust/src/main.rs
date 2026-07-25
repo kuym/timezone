@@ -256,9 +256,13 @@ fn run() -> Result<(), String> {
         let st = out.tree_stats(Some(opt.max_ops));
         eprintln!(
             "quadtree: {{\"nodes\":{},\"leaves\":{},\"refs\":{},\"erefs\":{},\"maxDepth\":{},\
-             \"maxLeafRefs\":{},\"maxLeafCost\":{},\"leavesOverLimit\":{}}}",
+             \"maxLeafRefs\":{},\"maxLeafCost\":{},\"maxLeafTrueCost\":{},\"leavesOverLimit\":{}}}",
             st.nodes, st.leaves, st.refs, st.erefs, st.max_depth, st.max_leaf_refs, st.max_leaf_cost,
-            st.leaves_over_limit.unwrap_or(0)
+            st.max_leaf_true_cost, st.leaves_over_limit.unwrap_or(0)
+        );
+        eprintln!(
+            "  (maxLeafCost is the --max-ops-governed reducible cost; maxLeafTrueCost adds arc \
+             reconstruction, which subdivision cannot reduce — lower it with --vw)"
         );
 
         out.annotate();

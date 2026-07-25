@@ -3,7 +3,7 @@
 //! no whitespace; object keys in the same order the JS writer emits).
 
 use super::Serializer;
-use crate::build::{Cand, Node, Output, Zone};
+use crate::build::{ArcRun, Cand, Node, Output, Zone};
 use crate::polycodec;
 use crate::quant;
 use crate::topology::ArcRef;
@@ -131,10 +131,11 @@ fn write_node(s: &mut String, out: &Output, idx: usize) {
     s.push('}');
 }
 
-// Candidate key order: z, w, e, h.
+// Candidate key order: z, w, e, h.  `e` is a list of crossing arcs, each
+// `[arcIndex, [[first,last],...]]` where arcIndex indexes the ring's arc-ref list.
 fn write_cand(s: &mut String, c: &Cand) {
     s.push_str(&format!("{{\"z\":{},\"w\":{},\"e\":", c.z, c.w));
-    write_runs(s, &c.e);
+    write_arc_runs(s, &c.e);
     if !c.h.is_empty() {
         s.push_str(",\"h\":[");
         for (i, hc) in c.h.iter().enumerate() {
@@ -142,12 +143,25 @@ fn write_cand(s: &mut String, c: &Cand) {
                 s.push(',');
             }
             s.push_str(&format!("{{\"i\":{},\"w\":{},\"e\":", hc.i, hc.w));
-            write_runs(s, &hc.e);
+            write_arc_runs(s, &hc.e);
             s.push('}');
         }
         s.push(']');
     }
     s.push('}');
+}
+
+fn write_arc_runs(s: &mut String, e: &[ArcRun]) {
+    s.push('[');
+    for (i, ar) in e.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("[{},", ar.a));
+        write_runs(s, &ar.runs);
+        s.push(']');
+    }
+    s.push(']');
 }
 
 fn write_runs(s: &mut String, runs: &[(u32, u32)]) {

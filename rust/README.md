@@ -30,18 +30,37 @@ cd ..
 
 | flag | default | meaning |
 |---|---|---|
-| `--max-ops=N` | 500 | per-leaf lookup cost budget; leaves over it split |
+| `--max-ops=N` | 500 | per-leaf **reducible** lookup cost budget (traversal + localized point-in-polygon edges); leaves over it split |
 | `--max-splits=N` | unlimited | hard cap on splits; **takes precedence** over `--max-ops` |
 | `--epsilon=N` | 8 | RDP simplification tolerance, in quantized units |
-| `--vw=F` | 1.0 | (json/binary) Visvalingam–Whyatt: keep fraction F of each shared arc's vertices; 1.0 = lossless |
+| `--vw=F` | 1.0 | (json/binary) Visvalingam–Whyatt: keep fraction F of each shared arc's vertices; 1.0 = lossless. Also the lever for **arc-reconstruction** lookup cost (`maxLeafTrueCost`) |
 | `--verify=N` | 3000 | random points cross-checked against brute force (0 disables) |
-| `--format=json\|binary` | json | output serializer (binary is a **stub**, see below) |
+| `--format=json\|binary\|quad` | json | output serializer (see Serializers below) |
 | `--input=PATH` | data/combined.json | GeoJSON FeatureCollection |
 | positional | quadtree.json | output path |
 
 ```sh
-cargo test --release             # 12 unit tests (geom, quant, codec, cells)
+cargo test --release             # unit tests (geom, quant, codec, cells, topology)
 ```
+
+### Lookup cost: two numbers, two levers
+
+A lookup costs `depth + arc-reconstruction + 2 × localized-edges`. Candidates are
+**arc-localized**: a leaf records, per candidate, only the arcs whose edges cross
+the cell (see quadtree.md §5.1), so a reader decodes just those arcs — not the
+candidate's whole ring. The build reports two figures:
+
+- **`maxLeafCost`** — the **reducible** cost (`depth + 2 × localized-edges`). This
+  is what `--max-ops` governs, because splitting a cell lowers it (a smaller cell
+  is crossed by fewer edges). `--max-ops` is met exactly.
+- **`maxLeafTrueCost`** — the full cost a reader pays, adding **arc
+  reconstruction** (only the crossing arcs now, so far lower than rebuilding whole
+  rings — e.g. worst leaf ~3.4k vs ~26.7k before arc-localization). It still has a
+  floor: an arc is an atomic delta-chain that must be decoded in full, and a long
+  arc crossing a cell crosses every sub-cell, so this is *not* subdivision-reducible
+  and is deliberately kept out of `--max-ops` (counting it would split big-zone
+  borders uselessly to MAX_DEPTH). Lower it with **`--vw`**, which shrinks the arcs.
+  This is the same accounting `tzlookup_binary.js` reports per lookup.
 
 ## Module map (mirrors the JS files)
 

@@ -151,7 +151,10 @@ fn cut_ring(ring: &[Pt], junc: &HashSet<Pt>) -> Vec<Vec<Pt>> {
         let mut i = start;
         loop {
             arc.push(ring[i]);
-            if i == end {
+            // `arc.len() > 1` so a single-junction ring (start == end) traverses
+            // the whole loop back to the junction instead of stopping on the very
+            // first vertex (which would yield a degenerate 1-vertex arc).
+            if i == end && arc.len() > 1 {
                 break;
             }
             i = (i + 1) % n;
@@ -212,6 +215,21 @@ mod tests {
         assert!(arcs.len() < uses, "the shared border should be a single deduped arc");
         let shared = refs[0].iter().find(|r| refs[1].iter().any(|s| s.arc == r.arc)).unwrap();
         assert!(refs[1].iter().any(|s| s.arc == shared.arc && s.rev != shared.rev));
+    }
+
+    #[test]
+    fn single_junction_ring_survives() {
+        // Two rings touching at exactly one shared vertex (10,0): that vertex is
+        // the only junction of each ring.  Both must still reconstruct in full.
+        let a = vec![[0, 0], [10, 0], [5, 8]];
+        let b = vec![[10, 0], [20, 0], [15, 8]];
+        let (arcs, refs) = build(&[a.clone(), b.clone()]);
+        let ra = reconstruct(&arcs, &refs[0]);
+        let rb = reconstruct(&arcs, &refs[1]);
+        assert_eq!(ra.len(), a.len(), "single-junction ring A lost vertices");
+        assert_eq!(rb.len(), b.len(), "single-junction ring B lost vertices");
+        assert!(is_rotation(&a, &ra));
+        assert!(is_rotation(&b, &rb));
     }
 
     #[test]

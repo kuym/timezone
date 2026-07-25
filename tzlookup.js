@@ -166,21 +166,38 @@
   // edge outside the cell can cross it, and wn(point) = wn(center) + crossings.
   //
   // `cand` carries, for the leaf's cell: `w` (winding of the cell center wrt the
-  // full outer ring) and `e` (outer edge-index runs intersecting the cell), plus
-  // `h` = [{i, w, e}] for each hole that crosses the cell (holes that do not
-  // cross cannot change the answer for any point in the cell, so they are
-  // omitted).  Falls back to the full test on any degeneracy.
+  // full outer ring) and `e`, the outer arcs that cross the cell — each an
+  // `[arcIndex, [[first,last],...]]` naming an entry of the ring's arc-ref list
+  // and its local crossing edge runs.  `h` = [{i, w, e}] does the same per
+  // crossing hole.  A reader decodes ONLY those crossing arcs, not the whole
+  // ring.  (Legacy per-zone artifacts without `arcs` fall back to full rings and
+  // flat edge runs.)  Falls back to the full test on any degeneracy.
   function localContainsZone(zone, cell, cand, point, stats, arcs) {
-    const rings = zoneRings(zone, arcs);
     const C = cellCenter(cell);
 
+    if (arcs) {
+      const outerDelta = arcCrossings(cand.e, zone.outer, arcs, C, point, stats);
+      if (outerDelta === null) { return fullFallback(zone, arcs, point, stats); }
+      if (cand.w + outerDelta == 0) { return false; }   // outside the exterior ring
+      const holes = cand.h || [];
+      for (let k = 0; k < holes.length; k++) {
+        const hc = holes[k];
+        const holeDelta = arcCrossings(hc.e, zone.h[hc.i], arcs, C, point, stats);
+        if (holeDelta === null) { return fullFallback(zone, arcs, point, stats); }
+        if (hc.w + holeDelta != 0) { return false; }    // inside a hole
+      }
+      return true;
+    }
+
+    // Legacy: `e` is flat ring-edge runs against the full decoded ring.
+    const rings = zoneRings(zone, arcs);
+    if (stats) { stats.reconVertices += fullRingVertices(rings); }
     const outerDelta = segmentCrossings(C, point, rings.outer, cand.e, stats);
     if (outerDelta === null) {
       if (stats) { stats.fallbacks++; stats.vertices += fullRingVertices(rings); }
       return geom.RingsContainPoint(rings.outer, rings.holes, point);
     }
-    if (cand.w + outerDelta == 0) { return false; }     // outside the exterior ring
-
+    if (cand.w + outerDelta == 0) { return false; }
     const holes = cand.h || [];
     for (let k = 0; k < holes.length; k++) {
       const hc = holes[k], holeRing = rings.holes[hc.i];
@@ -189,9 +206,36 @@
         if (stats) { stats.fallbacks++; stats.vertices += fullRingVertices(rings); }
         return geom.RingsContainPoint(rings.outer, rings.holes, point);
       }
-      if (hc.w + holeDelta != 0) { return false; }      // inside a hole
+      if (hc.w + holeDelta != 0) { return false; }
     }
     return true;
+  }
+
+  // One arc's vertices as they appear in the ring: arcs[|ref|], reversed if ref<0.
+  function ringArc(arcs, signedRef) {
+    const rev = signedRef < 0, arc = arcs[rev ? -signedRef - 1 : signedRef];
+    return rev ? arc.slice().reverse() : arc;
+  }
+
+  // Sum of signed center->point ray crossings over a ring's crossing arcs,
+  // decoding only those arcs.  null on any degeneracy (caller falls back).
+  function arcCrossings(arcRuns, refs, arcs, C, point, stats) {
+    let total = 0;
+    for (let i = 0; i < arcRuns.length; i++) {
+      const arcPts = ringArc(arcs, refs[arcRuns[i][0]]);
+      if (stats) { stats.reconVertices += arcPts.length; }
+      const d = segmentCrossings(C, point, arcPts, arcRuns[i][1], stats);
+      if (d === null) { return null; }
+      total += d;
+    }
+    return total;
+  }
+
+  // Degeneracy fallback: rebuild the whole ring and run a full point-in-polygon.
+  function fullFallback(zone, arcs, point, stats) {
+    const rings = zoneRings(zone, arcs);
+    if (stats) { stats.fallbacks++; stats.vertices += fullRingVertices(rings); }
+    return geom.RingsContainPoint(rings.outer, rings.holes, point);
   }
 
   function pointInZone(zone, point, stats, arcs) {
@@ -203,7 +247,7 @@
       }
     }
     const rings = zoneRings(zone, arcs);
-    if (stats) { stats.vertices += fullRingVertices(rings); }
+    if (stats) { stats.reconVertices += fullRingVertices(rings); stats.vertices += fullRingVertices(rings); }
     return geom.RingsContainPoint(rings.outer, rings.holes, point);
   }
 
@@ -258,7 +302,7 @@
     //                localized subsets, or a full ring on a degeneracy fallback)
     //   fallbacks  - tests that fell back to the full ring
     const stats = {depth: hit.path.length, candidates: hit.candidates.length,
-                   vertices: 0, fallbacks: 0};
+                   vertices: 0, reconVertices: 0, fallbacks: 0};
 
     // erefs contain the point by construction; no geometry test needed.
     for (let i = 0; i < hit.definite.length; i++) {
