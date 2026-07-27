@@ -82,16 +82,20 @@ driver is format-agnostic and a new format is one `impl`:
 - **`json`** — complete; produces the exact `quadtree.json` schema (see
   `../quadtree.md`), compact and with the same key ordering as the JS writer.
 - **`binary`** — full-artifact compact format, **complete** (`is_complete()` is
-  true). **887 KB** lossless (`--vw=1.0`) — no base64, the quadtree optimizations,
+  true). **~842 KB** lossless (`--vw=1.0`) — no base64, the quadtree optimizations,
   and topological shared-arc geometry. `--vw` trades accuracy for size (e.g.
   ~600 KB at `--vw=0.5`, ~440 KB at `--vw=0.25`). Four sections after a fixed
-  header (magic `TZQT`, version, quant block, counts incl. arc count):
+  header (magic `TZQT`, version, quant block, counts incl. arc count) — roughly
+  arcs 654 KB, quadtree 135 KB, zones 49 KB, tz names 4 KB. Every section uses
+  LEB128 varints with delta-coding (arc origins, arc refs, candidate arc indices):
 
   1. **quadtree** — reuses the `quad` format's primitives (the `q` varint in
      `serialize/qvarint.rs`, plus recursive length-prefixed skippable nodes) but
      encodes the real cost-model tree: each node's `eref` list and, at leaves, the
-     `ref` candidates with their localized point-in-polygon data (winding, edge
-     runs, holes). Four encodings squeeze it 30% (104,637 → 73,077 bytes):
+     `ref` candidates with their **arc-localized** point-in-polygon data (winding,
+     and per crossing-arc edge runs, so a reader decodes only those arcs — see
+     quadtree.md §5.1). Four encodings (P1/P2/P4/P5) shrink the node/candidate
+     structure; arc-localization then enlarges candidates for the lookup speedup:
      - **P1** packs each candidate's winding, run count and hole presence into one
        `q` (winding is only ever −1/0/+1, holes almost always absent);
      - **P2** folds a node's internal/eref flags and leaf ref-count into one `q`;
@@ -104,10 +108,16 @@ driver is format-agnostic and a new format is one `impl`:
      ~80% of their edges; each unique arc is stored once as an origin + packed
      delta stream (`polycodec`, raw, no base64). This is where the geometry lives.
   3. **zones** — one record per zone in rank order: `tzid`, area, aabb, then the
-     outer ring and each hole as a list of **arc references** (`(index<<1)|reversed`),
-     not vertices. A reader rebuilds the ring by concatenating the referenced arcs
-     (see `topology::reconstruct`).
-  4. **tz names** — length-prefixed UTF-8, indexed by tzid.
+     outer ring and each hole as a list of **arc references** (not vertices; a
+     reader rebuilds the ring via `topology::reconstruct`). All values are LEB128
+     varints, and the arc indices are **delta-coded** — ~50% are consecutive in
+     ring order, so most refs are one byte (section −39%, 81 → 49 KB).
+  4. **tz names** — **front-coded** (prefix-compressed): names are alphabetized and
+     each stores only its shared-prefix length with the previous plus its suffix,
+     so `America/` and the like are stored once — a linearized prefix tree
+     (−46%, 7 → 3.8 KB). `zone.tzid` is remapped to this alphabetical order, so the
+     binary's tzid space differs from the JSON's (insertion order) — both resolve
+     to the same names.
 
   Two integer encodings appear: the `q` varint (small/paddable values — tree
   structure) and, in the zones section, an **exact** varint (`q` byte-count + that

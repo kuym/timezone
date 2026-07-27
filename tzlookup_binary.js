@@ -11,22 +11,23 @@
 // polycodec.decodePolygon, so the resolution logic is shared, not duplicated.
 //
 // Format (see rust/src/serialize/binary.rs for the authority):
-//   header (52 bytes): magic "TZQT", version:u16, quant (xMin/xMax/yMin/yMax:i32,
-//     xScale/yScale:f64, maxDepth:u16), counts (zones/tz/nodes: u32)  — all LE
-//   section 1 quadtree: node := bodyLen:q, hdr:q (bit0=internal, bit1=hasEref,
-//     leaf: bits2+=refCount), [erefCount:q, erefCount×rankDelta:q],
+//   header (56 bytes): magic "TZQT", version:u16, quant (xMin/xMax/yMin/yMax:i32,
+//     xScale/yScale:f64, maxDepth:u16), counts (zones/tz/nodes/arcs: u32)  — all LE
+//   section 1 quadtree (`q` varints): node := bodyLen, hdr (bit0=internal,
+//     bit1=hasEref, leaf: bits2+=refCount), [erefCount, erefCount×rankDelta],
 //     internal → 4 children | leaf → refCount × candidate
-//     candidate := zDelta:q, packed:q ((runCount<<3)|(windCode<<1)|hasHoles),
-//       [w:zigzag-q if windCode==3], runCount×(gap:q,len:q),
-//       [holeCount:q, holeCount×(i:q, w:zigzag-q, count:q, count×(gap:q,len:q))]
-//   section 2 zones (rank order): tzid:q, area:uintLE, aabb (xLo:coord, yLo:coord,
-//     w:uintLE, h:uintLE), ring (ox:coord, oy:coord, pLen:uintLE, p bytes),
-//     holeCount:q, holeCount × ring
-//   section 3 tz names: count:q, count × (nameLen:q, UTF-8 bytes)
+//     candidate := zDelta, packed ((arcCount<<3)|(windCode<<1)|hasHoles),
+//       [w:zigzag if windCode==3], arcCount × arcRuns, [hole data]
+//     arcRuns := (arcIdxDelta<<1 | hasMore), gap0, len0, [if hasMore: extra + runs]
+//   section 2 arcs (LEB128): arcCount × ( ox:svar, oy:svar delta from prev arc,
+//     pLen:uvar, p bytes )
+//   section 3 zones (LEB128, rank order): tzid:uvar, area:uvar, aabb (xLo:svar,
+//     yLo:svar, w:uvar, h:uvar), outer/hole arc-refs (delta-coded), holeCount:uvar
+//   section 4 tz names: front-coded — count:uvar, count × (sharedLen:uvar,
+//     sufLen:uvar, suffix bytes); names alphabetized, tzid remapped to that order
 //
-//   q       = the 3-form varint (A 1-byte <128, B 2-byte <16512, C 3-byte even).
-//   uintLE  = exact varint: q byte-count, then that many little-endian bytes.
-//   coord   = unzigzag(uintLE)  (signed).
+//   q    = the 3-form varint (A 1-byte <128, B 2-byte <16512, C 3-byte even).
+//   uvar = LEB128 unsigned;  svar = zigzag LEB128 (signed).
 //   Zones are referenced by rank (frequency order); rank indexes the zones list.
 
 (function (root, factory) {
@@ -69,33 +70,43 @@
   Cursor.prototype.coord = function () {
     return unzigzag(this.uintLE());
   };
+  // LEB128 varints (zones + tz-names sections).
+  Cursor.prototype.uvar = function () {
+    let v = 0, shift = 0, b;
+    do {
+      b = this.b[this.pos++];
+      v += (b & 0x7F) * Math.pow(2, shift);
+      shift += 7;
+    } while (b & 0x80);
+    return v;
+  };
+  Cursor.prototype.svar = function () {
+    return unzigzag(this.uvar());
+  };
   Cursor.prototype.take = function (n) {
     const s = this.b.subarray(this.pos, this.pos + n);
     this.pos += n;
     return s;
   };
 
-  function readRuns(c, count) {
-    const runs = [];
-    let prev = 0;
-    for (let i = 0; i < count; i++) {
-      const first = prev + c.q();
-      const last = first + c.q();
-      runs.push([first, last]);
-      prev = last + 1;
-    }
-    return runs;
-  }
 
-  // Each crossing arc: arcIndex (delta from previous) then local edge run count +
-  // runs.  Returns [[arcIndex, [[first,last],...]], ...] as tzlookup expects.
+  // Each crossing arc: (arcIdxDelta << 1 | hasMoreRuns), the first run inline
+  // (gap, len), then (only if hasMore) the remaining run count + runs.  Returns
+  // [[arcIndex, [[first,last],...]], ...] as tzlookup expects.
   function readArcRuns(c, arcCount) {
     const out = new Array(arcCount);
     let cum = 0;
     for (let i = 0; i < arcCount; i++) {
-      cum += c.q();
-      const rc = c.q();
-      out[i] = [cum, readRuns(c, rc)];
+      const v = c.q();
+      cum += Math.floor(v / 2);
+      const f0 = c.q(), l0 = f0 + c.q();
+      const runs = [[f0, l0]];
+      if (v & 1) {
+        const extra = c.q();
+        let prev = l0 + 1;
+        for (let k = 0; k < extra; k++) { const f = prev + c.q(); const l = f + c.q(); runs.push([f, l]); prev = l + 1; }
+      }
+      out[i] = [cum, runs];
     }
     return out;
   }
@@ -157,15 +168,16 @@
     return node;
   }
 
-  // A ring's arc references: count, then each (arcIndex<<1|reversed) as uintLE,
-  // returned in the signed convention tzlookup.reconstructRing expects
-  // (i forward, -i-1 reversed).
-  function readArcRefs(c) {
-    const n = c.q();
+  // A ring's arc references: count, then each as (zigzag(arcIdx - prev) << 1 |
+  // reversed) delta from `st.prev` (which runs across the zone's rings).  Returned
+  // in the signed convention tzlookup.reconstructRing expects (i / -i-1 reversed).
+  function readArcRefs(c, st) {
+    const n = c.uvar();
     const refs = new Array(n);
     for (let i = 0; i < n; i++) {
-      const v = c.uintLE();
-      refs[i] = (v & 1) ? -(v >> 1) - 1 : (v >> 1);
+      const v = c.uvar();
+      st.prev += unzigzag(Math.floor(v / 2));
+      refs[i] = (v & 1) ? -st.prev - 1 : st.prev;
     }
     return refs;
   }
@@ -201,16 +213,18 @@
     // section 1: quadtree
     this.quadtree = parseNode(c);
 
-    // section 2: arcs (shared boundaries; decoded to vertices lazily).  Record
-    // each arc's byte offset for seek reporting.
+    // section 2: arcs (shared boundaries; decoded to vertices lazily).  Origins
+    // are delta-coded against the previous arc; record each arc's byte offset for
+    // seek reporting.
     this._arcMeta = new Array(arcCount);
     this._arcs = new Array(arcCount);
     this.arcOffset = new Array(arcCount);
+    let ax = 0, ay = 0;
     for (let i = 0; i < arcCount; i++) {
       this.arcOffset[i] = c.pos;
-      const ox = c.coord(), oy = c.coord();
-      const pLen = c.uintLE();
-      this._arcMeta[i] = { o: [ox, oy], praw: c.take(pLen) };
+      ax += c.svar(); ay += c.svar();
+      const pLen = c.uvar();
+      this._arcMeta[i] = { o: [ax, ay], praw: c.take(pLen) };
     }
     // A lazily-decoding view of the arcs: `arcs[i]` decodes arc i on first access.
     // Passed to tzlookup, so only the arcs a lookup actually touches are decoded.
@@ -228,26 +242,31 @@
     this.zoneOffset = new Array(zoneCount);
     for (let rank = 0; rank < zoneCount; rank++) {
       this.zoneOffset[rank] = c.pos;
-      const tzid = c.q();
-      const area = c.uintLE();
-      const xLo = c.coord(), yLo = c.coord();
-      const w = c.uintLE(), h = c.uintLE();
-      const outer = readArcRefs(c);
-      const holeCount = c.q();
+      const tzid = c.uvar();
+      const area = c.uvar();
+      const xLo = c.svar(), yLo = c.svar();
+      const w = c.uvar(), h = c.uvar();
+      const st = { prev: 0 }; // arc-index delta state, running across this zone's rings
+      const outer = readArcRefs(c, st);
+      const holeCount = c.uvar();
       const holeRefs = new Array(holeCount);
-      for (let i = 0; i < holeCount; i++) { holeRefs[i] = readArcRefs(c); }
+      for (let i = 0; i < holeCount; i++) { holeRefs[i] = readArcRefs(c, st); }
       this.zones[rank] = {
         tzid: tzid, a: area, aabb: [[xLo, yLo], [xLo + w, yLo + h]],
         outer: outer, h: holeRefs,
       };
     }
 
-    // section 4: tz names (indexed by tzid)
-    const nNames = c.q();
-    this.tzNames = new Array(tzCount);
+    // section 4: tz names — front-coded (prefix-compressed), in the alphabetical
+    // order `tzid` was remapped to: each name = prev[:sharedLen] + suffix.
+    const nNames = c.uvar();
+    this.tzNames = new Array(nNames);
+    let prevName = "";
     for (let i = 0; i < nNames; i++) {
-      const len = c.q();
-      this.tzNames[i] = bufToStr(c.take(len));
+      const shared = c.uvar();
+      const suffix = bufToStr(c.take(c.uvar()));
+      prevName = prevName.slice(0, shared) + suffix; // ASCII: byte prefix == char prefix
+      this.tzNames[i] = prevName;
     }
   }
 
