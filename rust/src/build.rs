@@ -191,11 +191,10 @@ impl Output {
         }
 
         let (arcs_full, ring_refs) = topology::build(&rings);
-        let mut arcs: Vec<Vec<Pt>> = if vw >= 1.0 {
-            arcs_full.clone()
-        } else {
-            arcs_full.iter().map(|a| topology::vw_simplify(a, vw)).collect()
-        };
+        let mut arcs: Vec<Vec<Pt>> = arcs_full.clone();
+        // VW simplification is applied to the shared arcs (after topology), so a
+        // shared border simplifies once and stays identical for both zones.
+        topology::vw_simplify_all(&mut arcs, vw);
 
         // Map flat ring indices back to (zone, outer|hole).
         let mut flat = 0usize;

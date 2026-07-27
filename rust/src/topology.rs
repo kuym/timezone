@@ -61,38 +61,56 @@ pub fn reconstruct(arcs: &[Vec<Pt>], refs: &[ArcRef]) -> Vec<Pt> {
     ring
 }
 
-/// Visvalingam–Whyatt on one arc: keep the two endpoints, drop interior vertices
-/// by ascending effective area until `keep_fraction` of the vertices remain
-/// (1.0 = untouched).  A closed arc (a ring with no junctions) keeps ≥4 vertices
-/// so the reconstructed ring stays valid; an open arc keeps ≥2 (its endpoints).
-pub fn vw_simplify(arc: &[Pt], keep_fraction: f64) -> Vec<Pt> {
-    let n = arc.len();
-    if n <= 2 || keep_fraction >= 1.0 {
-        return arc.to_vec();
+/// Visvalingam–Whyatt simplification across ALL arcs, in place.
+///
+/// `keep_fraction` (1.0 = untouched, lower = more aggressive) picks a single
+/// **significance threshold**: the effective (triangle) area at the
+/// `1 - keep_fraction` quantile of every arc's interior vertices.  Each arc then
+/// iteratively drops its least-significant interior vertex while that vertex's
+/// area is below the threshold — always keeping its endpoint junctions, and a
+/// per-arc minimum so a reconstructed ring stays valid.
+///
+/// The threshold is **global and significance-based**, not a per-arc vertex
+/// count.  A fixed per-arc fraction is wrong: it deletes high-significance
+/// vertices on short arcs — e.g. a state-border corner stored as a 4-vertex arc
+/// would collapse to a straight chord, slicing a large area off the polygon.  A
+/// significance threshold keeps such corners (their effective area is huge) while
+/// still shaving low-area coastline wiggles everywhere.
+pub fn vw_simplify_all(arcs: &mut [Vec<Pt>], keep_fraction: f64) {
+    if keep_fraction >= 1.0 {
+        return;
     }
-    let min_keep = if arc[0] == arc[n - 1] { 4 } else { 2 };
-    let mut target = (n as f64 * keep_fraction).round() as usize;
-    target = target.clamp(min_keep, n);
-    if target >= n {
-        return arc.to_vec();
+    let mut areas: Vec<i64> = Vec::new();
+    for arc in arcs.iter() {
+        for i in 1..arc.len().saturating_sub(1) {
+            areas.push(tri_area2(arc[i - 1], arc[i], arc[i + 1]));
+        }
     }
-    let mut pts = arc.to_vec();
-    while pts.len() > target {
-        let mut min_area = i64::MAX;
-        let mut min_i = 0usize;
-        for i in 1..pts.len() - 1 {
-            let a = tri_area2(pts[i - 1], pts[i], pts[i + 1]);
-            if a < min_area {
-                min_area = a;
-                min_i = i;
+    if areas.is_empty() {
+        return;
+    }
+    areas.sort_unstable();
+    let k = (((1.0 - keep_fraction) * areas.len() as f64).round() as usize).min(areas.len() - 1);
+    let threshold = areas[k];
+
+    for arc in arcs.iter_mut() {
+        let min_keep = if arc[0] == arc[arc.len() - 1] { 4 } else { 2 };
+        while arc.len() > min_keep {
+            let mut min_area = i64::MAX;
+            let mut min_i = 0usize;
+            for i in 1..arc.len() - 1 {
+                let a = tri_area2(arc[i - 1], arc[i], arc[i + 1]);
+                if a < min_area {
+                    min_area = a;
+                    min_i = i;
+                }
             }
+            if min_i == 0 || min_area >= threshold {
+                break;
+            }
+            arc.remove(min_i);
         }
-        if min_i == 0 {
-            break;
-        }
-        pts.remove(min_i);
     }
-    pts
 }
 
 // Twice the area of triangle (a, b, c) — the VW effective area of vertex b.
@@ -233,11 +251,16 @@ mod tests {
     }
 
     #[test]
-    fn vw_keeps_endpoints_and_reduces() {
-        let arc = vec![[0, 0], [10, 1], [20, 0], [30, 1], [40, 0]];
-        let s = vw_simplify(&arc, 0.5);
-        assert!(s.len() < arc.len());
-        assert_eq!(s[0], arc[0]);
-        assert_eq!(*s.last().unwrap(), *arc.last().unwrap());
+    fn vw_keeps_endpoints_and_significant_corners() {
+        // A near-flat arc (small, low-area wiggles) plus a sharp high-area corner
+        // arc.  VW must shave the wiggles but keep the corner, keeping endpoints.
+        let flat = vec![[0, 0], [10, 1], [25, 0], [45, 2], [70, 0]];
+        let corner = vec![[0, 0], [0, 1000], [1000, 1000]]; // middle vertex = big corner
+        let mut arcs = vec![flat.clone(), corner.clone()];
+        vw_simplify_all(&mut arcs, 0.5);
+        assert!(arcs[0].len() < flat.len(), "flat wiggles should be simplified");
+        assert_eq!(arcs[0][0], flat[0]);
+        assert_eq!(*arcs[0].last().unwrap(), *flat.last().unwrap());
+        assert_eq!(arcs[1], corner, "the significant corner must be kept intact");
     }
 }

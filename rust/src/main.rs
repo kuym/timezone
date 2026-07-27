@@ -81,8 +81,9 @@ OPTIONS:
                                                                  [default: unlimited]
     --leaf-km=N        (quad format) stop splitting a cell once its longest edge is
                        under N km; the majority-area tzid wins.        [default: 10]
-    --vw=F             (json/binary) Visvalingam–Whyatt lossy simplification: keep
-                       fraction F (0.0..=1.0) of each shared arc's vertices.
+    --vw=F             (json/binary) Visvalingam–Whyatt lossy simplification: drop
+                       shared-arc vertices below a global significance (effective-
+                       area) threshold; F (0.0..=1.0) sets how many survive.
                        1.0 = lossless (no simplification).             [default: 1.0]
     --verify=N         Cross-check N random points against brute force (0 disables).
                                                                      [default: 3000]

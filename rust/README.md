@@ -33,7 +33,7 @@ cd ..
 | `--max-ops=N` | 500 | per-leaf **reducible** lookup cost budget (traversal + localized point-in-polygon edges); leaves over it split |
 | `--max-splits=N` | unlimited | hard cap on splits; **takes precedence** over `--max-ops` |
 | `--epsilon=N` | 8 | RDP simplification tolerance, in quantized units |
-| `--vw=F` | 1.0 | (json/binary) Visvalingam–Whyatt: keep fraction F of each shared arc's vertices; 1.0 = lossless. Also the lever for **arc-reconstruction** lookup cost (`maxLeafTrueCost`) |
+| `--vw=F` | 1.0 | (json/binary) Visvalingam–Whyatt: drop shared-arc vertices below a **global significance threshold** (F sets how many survive); 1.0 = lossless. The threshold is significance-based, not a per-arc count, so high-area corners survive even on short arcs. Also the lever for **arc-reconstruction** lookup cost (`maxLeafTrueCost`) |
 | `--verify=N` | 3000 | random points cross-checked against brute force (0 disables) |
 | `--format=json\|binary\|quad` | json | output serializer (see Serializers below) |
 | `--input=PATH` | data/combined.json | GeoJSON FeatureCollection |
@@ -41,6 +41,23 @@ cd ..
 
 ```sh
 cargo test --release             # unit tests (geom, quant, codec, cells, topology)
+```
+
+### Verifying a lossy build
+
+The build's `--verify` checks the quadtree against brute force on the *same*
+geometry, so it can't see a region that lossy `--vw` simplification dropped
+entirely (tree and brute force then agree it's "ocean"). `../tzverify.js`
+cross-checks two artifacts instead — resolve a dense lon/lat grid through a
+lossless reference and a lossy candidate (JSON or binary, auto-detected) and
+report disagreements clustered by timezone, so a dropped region shows up as a
+cluster of "reference had a tz, candidate says ocean". It exits non-zero if the
+land error exceeds `--max-error` or a single zone shows a land→ocean cluster.
+
+```sh
+tzconvert --format=binary --vw=1.0 ref.bin
+tzconvert --format=binary --vw=0.5 lossy.bin
+node tzverify.js ref.bin lossy.bin            # --grid=0.25° --max-error=0.5%
 ```
 
 ### Lookup cost: two numbers, two levers
